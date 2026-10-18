@@ -77,6 +77,11 @@ following every API pagination token. Import runs before Telegram polling and
 runs again on each application start. The same Drive file ID updates its
 existing local record. Unsupported formats are skipped. If a supported file
 cannot be read or the folder is inaccessible, startup stops with an error.
+Download errors identify the filename and HTTP status without logging API keys
+or request URLs. Google can reject automated downloads even when the same file
+can be downloaded in a browser. In that case, check API restrictions and usage
+in Google Cloud Console and try again later; changing archive permissions is
+not necessarily required.
 
 See Google's [public-folder API documentation](https://developers.google.com/workspace/drive/api/guides/search-files#list_files_in_a_public_folder).
 
@@ -85,10 +90,12 @@ See Google's [public-folder API documentation](https://developers.google.com/wor
 - `bot/__main__.py` - application entry point, router registration and polling.
 - `bot/config.py` - environment configuration and token validation.
 - `bot/handlers.py` - Telegram message handlers.
-- `bot/services/documents.py` - PDF, DOCX and TXT text extraction.
+- `bot/services/documents.py` - PDF text extraction and OCR with PyMuPDF,
+  plus DOCX and TXT parsing.
 - `bot/services/drive.py` - read-only public archive import.
 - `bot/storage.py` - SQLite metadata and original document storage.
 - `requirements.txt` - application dependencies.
+- `pytest.ini` - test discovery and application import path.
 - `Dockerfile` - application image definition.
 - `docker-compose.yaml` - single-service configuration.
 
@@ -109,11 +116,26 @@ With the application running and a valid token configured:
 
 ## Document processing
 
-The document service accepts text-based PDF, DOCX and UTF-8 TXT files up to
-10 MiB. DOCX paragraphs and tables are read in document order. PDFs without
-a text layer, encrypted PDFs, empty files and unsupported formats are rejected.
-Only embedded PDF text is extracted. Text inside images is not recognized,
-including images on pages that also contain selectable text.
+The document service accepts PDF, DOCX and UTF-8 TXT files up to 10 MiB.
+PDF documents are limited to 100 pages. DOCX paragraphs and tables are read
+in document order. Encrypted PDFs, empty files and unsupported formats are rejected.
+
+For each PDF page, PyMuPDF extracts embedded text first. Pages without embedded
+text are rendered and recognized in memory through PyMuPDF's integrated OCR
+using Ukrainian and English language data (`ukr+eng`). PyMuPDF includes the
+Tesseract OCR engine; the application does not launch external OCR programs.
+Pages are kept in their original order.
+Text inside images on a page that also contains selectable text is not recognized.
+OCR accuracy depends on scan quality, layout and orientation; recognition errors
+are possible, especially in names and numbers. No document content is sent to
+an external OCR service, and original PDF files are preserved unchanged.
+
+OCR processes one page at a time, at up to 300 DPI. Resolution is reduced for
+large pages to keep the rendered image within 3500 pixels on its longest side.
+No temporary PDF or image files are written. PyMuPDF does not expose a hard OCR
+timeout; processing time depends on document complexity and page count.
+An OCR error stops import with an explanation. Import and OCR run again on each
+application start, so scanning a large archive can delay Telegram polling.
 
 The storage service keeps extracted text and metadata in `archive.sqlite3`
 and original file bytes under `documents/` within its configured data directory.
@@ -127,8 +149,28 @@ database and originals survive container restarts, rebuilds and
 
 ## Tests
 
+The Docker image includes PyMuPDF and both OCR language files. Poppler and
+Tesseract command-line programs are not required.
+
+To run OCR outside Docker, download `eng.traineddata` and `ukr.traineddata` from
+the official [Tesseract language data repository](https://github.com/tesseract-ocr/tessdata_fast)
+into one directory. Set `TESSDATA_PREFIX` to that directory in your terminal:
+
+```powershell
+$env:TESSDATA_PREFIX = "C:\path\to\tessdata"
+```
+
+On Linux / macOS:
+
+```sh
+export TESSDATA_PREFIX=/path/to/tessdata
+```
+
+Docker sets this variable automatically. Text-based PDF, DOCX and TXT parsing
+does not require OCR language files.
+
 For local development, create a Python 3.12 virtual environment and install
-the test dependencies:
+the dependencies:
 
 ```sh
 python -m venv .venv
@@ -137,16 +179,38 @@ python -m venv .venv
 On PowerShell:
 
 ```powershell
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+pytest
 ```
 
 On Linux / macOS:
 
 ```sh
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m pytest
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+pytest
 ```
+
+Run these commands from the repository root. Activate the environment in each
+new terminal. `pytest.ini` makes the `bot` package importable for both `pytest`
+and `python -m pytest`; `python -m pytest` explicitly uses the selected Python
+interpreter.
+
+Activation is optional when using the environment's Python directly. This also
+works if PowerShell blocks `Activate.ps1`:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+On Linux / macOS, the equivalent command is `.venv/bin/python -m pytest`.
 
 Tests use generated documents and temporary directories. They do not require
 Telegram tokens, Google credentials or private archive files.
+The real OCR test is skipped when the OCR language files are unavailable locally.
+To run every test, including real OCR, in the built Docker image:
+
+```sh
+docker compose run --rm --no-deps -T --volume "./tests:/app/tests:ro" bot python -m pytest -q -p no:cacheprovider /app/tests
+```

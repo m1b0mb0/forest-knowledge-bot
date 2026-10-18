@@ -1,15 +1,19 @@
 """Extract text from supported documents without executing their content."""
 
+import os
 from collections.abc import Iterable
 from io import BytesIO
-from pathlib import PurePath
+from math import isfinite
+from pathlib import Path, PurePath
 
+import pymupdf
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from pypdf import PdfReader
 
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+MAX_PDF_PAGES = 100
+MAX_OCR_IMAGE_PIXELS = 3500
 SUPPORTED_EXTENSIONS = frozenset({".pdf", ".docx", ".txt"})
 
 
@@ -37,23 +41,70 @@ def extract_document_text(content: bytes, filename: str) -> str:
 
 
 def _extract_pdf(content: bytes) -> str:
+    parser_error = "The PDF is damaged or unsupported."
     try:
-        reader = PdfReader(BytesIO(content))
-        if reader.is_encrypted:
-            raise ValueError("Encrypted PDF documents are unsupported.")
-        text = "\n\n".join(
-            page.extract_text() or "" for page in reader.pages
-        )
-    except Exception as error:
-        # Parser failures vary with the damaged PDF structure.
+        reader = pymupdf.open(stream=content, filetype="pdf")
+    except Exception:
+        raise ValueError(parser_error) from None
+
+    with reader:
+        try:
+            is_pdf = reader.is_pdf
+            encrypted = reader.is_encrypted or bool(
+                (reader.metadata or {}).get("encryption")
+            )
+            page_count = reader.page_count
+        except Exception:
+            raise ValueError(parser_error) from None
+        if not is_pdf:
+            raise ValueError(parser_error)
+        if encrypted:
+            raise ValueError("The PDF is encrypted and unsupported.")
+        if page_count > MAX_PDF_PAGES:
+            raise ValueError("The PDF exceeds the page limit.")
+
+        pages: list[str] = []
+        for number in range(page_count):
+            try:
+                page = reader.load_page(number)
+                text = page.get_text("text", sort=True).strip()
+            except Exception:
+                raise ValueError(parser_error) from None
+            if not text:
+                text = _ocr_pdf_page(page)
+            pages.append(text)
+
+    return "\n\n".join(pages)
+
+
+def _ocr_pdf_page(page: pymupdf.Page) -> str:
+    """Recognize one page in memory using PyMuPDF's built-in OCR engine."""
+    tessdata_value = os.getenv("TESSDATA_PREFIX", "").strip()
+    tessdata = Path(tessdata_value)
+    if not tessdata_value or not all(
+        (tessdata / f"{language}.traineddata").is_file()
+        for language in ("ukr", "eng")
+    ):
         raise ValueError(
-            "The PDF is damaged, encrypted or unsupported."
-        ) from error
-    if not text.strip():
-        raise ValueError(
-            "The PDF contains no extractable text."
+            "PDF OCR requires Ukrainian and English language data. "
+            "Run with Docker Compose or set TESSDATA_PREFIX."
         )
-    return text
+
+    longest_side = max(page.rect.width, page.rect.height)
+    if not isfinite(longest_side) or longest_side <= 0:
+        raise ValueError("The PDF page dimensions are invalid for OCR.")
+    dpi = min(300, int(MAX_OCR_IMAGE_PIXELS * 72 / longest_side))
+    if dpi < 1:
+        raise ValueError("The PDF page exceeds the OCR image size limit.")
+    try:
+        textpage = page.get_textpage_ocr(
+            language="ukr+eng", dpi=dpi, full=True, tessdata=str(tessdata)
+        )
+        return page.get_text("text", textpage=textpage, sort=True).strip()
+    except Exception:
+        raise ValueError(
+            "PDF OCR failed. Check the document and OCR language data."
+        ) from None
 
 
 def _extract_docx(content: bytes) -> str:

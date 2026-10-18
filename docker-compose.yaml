@@ -4,3 +4,8 @@ services:
     env_file:
       - .env
     init: true
+    volumes:
+      - bot_data:/app/data
+
+volumes:
+  bot_data:
