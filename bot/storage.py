@@ -94,9 +94,13 @@ class Store:
                     if previous is not None:
                         previous_path = Path(previous["relative_path"])
 
-                    if not destination.exists():
+                    destination_exists = destination.exists()
+                    if (
+                        not destination_exists
+                        or destination.stat().st_size != len(content)
+                    ):
                         self._write_file(destination, content)
-                        created_file = True
+                        created_file = not destination_exists
 
                     connection.execute(
                         """

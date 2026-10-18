@@ -74,8 +74,14 @@ files, permissions or folder contents.
 
 The importer reads supported files directly inside the configured folder,
 following every API pagination token. Import runs before Telegram polling and
-runs again on each application start. The same Drive file ID updates its
-existing local record. Unsupported formats are skipped. If a supported file
+runs again on each application start. After listing metadata, it reuses locally
+stored text and original bytes when the Drive file ID, non-empty modification
+time and filename match. A cached original must still exist, be non-empty and
+match the reported file size when available. Unchanged files are not downloaded,
+parsed or OCRed again. New or changed files, missing originals and empty cached
+text are imported again. The startup summary reports downloaded and reused files.
+The same Drive file ID updates its existing local record.
+Unsupported formats are skipped. If a supported file
 cannot be read or the folder is inaccessible, startup stops with an error.
 Download errors identify the filename and HTTP status without logging API keys
 or request URLs. Google can reject automated downloads even when the same file
@@ -134,8 +140,10 @@ OCR processes one page at a time, at up to 300 DPI. Resolution is reduced for
 large pages to keep the rendered image within 3500 pixels on its longest side.
 No temporary PDF or image files are written. PyMuPDF does not expose a hard OCR
 timeout; processing time depends on document complexity and page count.
-An OCR error stops import with an explanation. Import and OCR run again on each
-application start, so scanning a large archive can delay Telegram polling.
+An OCR error stops import with an explanation. The first import and later imports
+of changed files can delay Telegram polling. Unchanged documents reuse their
+stored text. Changing the parser or OCR settings does not automatically reprocess
+cached documents.
 
 The storage service keeps extracted text and metadata in `archive.sqlite3`
 and original file bytes under `documents/` within its configured data directory.

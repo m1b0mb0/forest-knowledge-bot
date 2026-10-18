@@ -124,6 +124,37 @@ def test_database_failure_keeps_previous_document_and_original_file(
     assert set((tmp_path / "documents").iterdir()) == original_files
 
 
+def test_database_failure_keeps_a_repaired_existing_original(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    store.upsert_drive_document("file-1", "rules.txt", b"original", "text", None)
+    original = store.list_documents()[0]
+    original_path = tmp_path / original.relative_path
+    original_path.write_bytes(b"")
+    with sqlite3.connect(store.database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER reject_update
+            BEFORE UPDATE ON documents
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated database failure');
+            END;
+            """
+        )
+
+    with pytest.raises(
+        sqlite3.IntegrityError, match="simulated database failure"
+    ):
+        store.upsert_drive_document(
+            "file-1", "rules.txt", b"original", "new text", None
+        )
+
+    assert store.list_documents() == [original]
+    assert original_path.read_bytes() == b"original"
+
+
 def test_updating_one_document_preserves_another_with_identical_content(
     tmp_path: Path,
 ) -> None:

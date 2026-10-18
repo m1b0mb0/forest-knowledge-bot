@@ -2,13 +2,15 @@
 
 import asyncio
 import logging
+from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 import aiohttp
 
 from bot.config import ArchiveSettings
 from bot.services.documents import MAX_DOCUMENT_BYTES, extract_document_text
-from bot.storage import Store
+from bot.storage import Document, Store
 
 logger = logging.getLogger(__name__)
 API_URL = "https://www.googleapis.com/drive/v3/files"
@@ -28,15 +30,21 @@ class DriveImportError(Exception):
 
 
 async def import_archive(settings: ArchiveSettings, store: Store) -> int:
-    """Download supported direct children and update their persistent records.
+    """Import supported direct children, reusing unchanged local documents.
 
     Import completes before polling starts. An unreadable supported file stops
     startup rather than silently serving an incomplete archive.
     """
+    stored_documents = await asyncio.to_thread(store.list_documents)
+    cached = {
+        document.source_id: document
+        for document in stored_documents
+        if document.source == "drive"
+    }
+    imported = downloaded = reused = 0
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         files = await _list_files(session, settings)
-        imported = 0
         for item in files:
             extension = FORMATS.get(item.get("mimeType"))
             if extension is None:
@@ -46,6 +54,12 @@ async def import_archive(settings: ArchiveSettings, store: Store) -> int:
                 raise DriveImportError(
                     f"Archive file {name!r} cannot be downloaded."
                 )
+            if _can_reuse_document(cached.get(file_id), item, store.data_dir):
+                imported += 1
+                reused += 1
+                logger.debug("Reused archive document %r", name)
+                continue
+            logger.info("Importing archive document %r", name)
             try:
                 content = await _download_file(session, settings, item)
                 text = await asyncio.to_thread(
@@ -68,15 +82,42 @@ async def import_archive(settings: ArchiveSettings, store: Store) -> int:
                 item.get("modifiedTime"),
             )
             imported += 1
-            logger.info(
-                "Imported archive document %s of %s", imported, len(files)
-            )
+            downloaded += 1
 
     if not imported:
         raise DriveImportError(
             "The archive has no supported PDF, DOCX or TXT files."
         )
+    logger.info(
+        "Archive import complete: %s downloaded, %s reused.",
+        downloaded,
+        reused,
+    )
     return imported
+
+
+def _can_reuse_document(
+    document: Document | None, item: dict[str, Any], data_dir: Path
+) -> bool:
+    """Require matching metadata, extracted text, and a complete original."""
+    modified_at = item.get("modifiedTime")
+    if (
+        document is None
+        or not modified_at
+        or modified_at != document.modified_at
+        or item["name"] != document.name
+        or not document.text.strip()
+    ):
+        return False
+    try:
+        original = (data_dir / document.relative_path).stat()
+        if not S_ISREG(original.st_mode) or original.st_size <= 0:
+            return False
+        if item.get("size") is not None:
+            return original.st_size == int(item["size"])
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 async def _list_files(
