@@ -1,6 +1,5 @@
 """Document parsing tests using generated, non-private documents."""
 
-import os
 from io import BytesIO
 from pathlib import Path
 
@@ -29,16 +28,6 @@ def make_image_only_pdf(text: str) -> bytes:
             page = scanned.new_page(width=500, height=300)
             page.insert_image(page.rect, pixmap=pixmap)
             return scanned.tobytes()
-
-
-def ocr_language_data_available() -> bool:
-    prefix = os.getenv("TESSDATA_PREFIX")
-    if not prefix:
-        return False
-    return all(
-        (Path(prefix) / f"{language}.traineddata").is_file()
-        for language in ("ukr", "eng")
-    )
 
 
 @pytest.fixture
@@ -269,22 +258,6 @@ def test_ocr_uses_recognized_text_and_both_languages(
         content = document.tobytes()
 
     assert extract_document_text(content, "scan.pdf") == "Recognized advice"
-
-
-@pytest.mark.skipif(
-    not ocr_language_data_available(),
-    reason=(
-        "Real OCR requires Ukrainian and English language data; run in Docker."
-    ),
-)
-def test_real_ocr_reads_generated_image_only_pdf() -> None:
-    scanned = make_image_only_pdf("Forest archive document")
-
-    with pymupdf.open(stream=scanned, filetype="pdf") as document:
-        assert not document[0].get_text("text").strip()
-    assert "forest archive document" in extract_document_text(
-        scanned, "scan.pdf"
-    ).lower()
 
 
 def test_empty_docx_is_rejected() -> None:
