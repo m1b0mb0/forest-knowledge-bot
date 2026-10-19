@@ -22,7 +22,7 @@ class LLMSettings:
     """Groq credentials and a model with the supported token budget."""
 
     api_key: str = field(repr=False)
-    model: str = "openai/gpt-oss-20b"
+    model: str = "openai/gpt-oss-120b"
 
 
 def load_llm_settings() -> LLMSettings:
@@ -30,7 +30,7 @@ def load_llm_settings() -> LLMSettings:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise ValueError("GROQ_API_KEY is missing.")
-    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
     if model not in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
         raise ValueError(
             "GROQ_MODEL must be openai/gpt-oss-20b or openai/gpt-oss-120b."

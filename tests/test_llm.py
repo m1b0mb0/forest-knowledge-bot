@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import traceback
 from dataclasses import replace
 from pathlib import Path
@@ -46,6 +47,16 @@ def payload(
     }
 
 
+def selection_payload(
+    *documents: Document, text: str = "",
+) -> dict[str, Any]:
+    return {
+        "status": "selected",
+        "document_ids": [item.id for item in documents],
+        "text": text,
+    }
+
+
 def response(value: Any, finish_reason: str = "stop") -> SimpleNamespace:
     content = value if isinstance(value, str) else json.dumps(
         value, ensure_ascii=False
@@ -73,6 +84,16 @@ def messages_text(call: Any) -> str:
     )
 
 
+def selection_catalog(call: Any) -> list[str]:
+    return [
+        line
+        for message in call.kwargs["messages"]
+        if message["role"] == "user"
+        for line in message["content"].splitlines()
+        if re.search(r" \[D\d+\]$", line)
+    ]
+
+
 @pytest.fixture(autouse=True)
 def avoid_tokenizer_download(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep unit tests independent of the tokenizer's vocabulary download."""
@@ -92,7 +113,9 @@ def test_selection_gets_names_then_answer_gets_selected_full_texts() -> None:
         document(2, "Як утеплити житло.docx", "Невибраний секретний текст."),
     ]
     service, create = assistant(
-        response(payload(text="Не показувати цей текст відбору.")),
+        response(selection_payload(
+            documents[0], text="Не показувати цей текст відбору."
+        )),
         response(payload(
             text="Внесок — 275 грн; не сплачувати до 15.11.2027."
         )),
@@ -111,15 +134,25 @@ def test_selection_gets_names_then_answer_gets_selected_full_texts() -> None:
     assert "Не показувати цей текст відбору." not in reply.text
     assert create.await_count == 2
     selection_call, answer_call = create.await_args_list
-    selection = messages_text(selection_call)
+    selection = json.dumps(selection_call.kwargs, ensure_ascii=False)
     answer = messages_text(answer_call)
     assert all(item.name in selection for item in documents)
+    assert all(
+        item.name in messages_text(selection_call) for item in documents
+    )
+    for item in documents:
+        assert selection.count(f"{item.name} [D{item.id}]") == 1
     assert "Вступ до правил." not in selection
     assert "Невибраний секретний текст." not in selection
     assert "Не сплачувати до 15.11.2027. Внесок — 275 грн." in answer
     assert answer.count("Вступ до правил.") == 90
     assert answer.count("Завершення документа.") == 90
     assert "Невибраний секретний текст." not in answer
+    schema = selection_call.kwargs["response_format"]["json_schema"]["schema"]
+    item_schema = schema["properties"]["document_ids"]["items"]
+    assert item_schema["type"] == "integer"
+    assert item_schema["enum"] == selection_payload(*documents)["document_ids"]
+    assert schema["properties"]["document_ids"]["maxItems"] == 3
     for call in create.await_args_list:
         assert call.kwargs["model"] == "test-model"
         assert question in call.kwargs["messages"][-1]["content"]
@@ -144,13 +177,74 @@ def test_catalog_is_sorted_and_excludes_inactive_or_empty_documents() -> None:
     reply = asyncio.run(service.answer("Питання про архів", documents))
 
     assert reply.text == NOT_FOUND
-    catalog = messages_text(create.await_args)
-    assert (
-        catalog.index("Перший документ.txt")
-        < catalog.index("Третій документ.txt")
+    assert selection_catalog(create.await_args) == [
+        "Перший документ.txt [D1]", "Третій документ.txt [D9]"
+    ]
+
+
+def test_catalog_keys_are_sent_once_even_for_a_large_catalog() -> None:
+    documents = [
+        document(
+            index, f"Синтетичні правила рукавички Місце {index}.txt",
+            f"Повний текст документа номер {index}.",
+        )
+        for index in range(1, 81)
+    ]
+    service, create = assistant(response(payload("not_found", [], "")))
+
+    asyncio.run(service.answer("Нерелевантне запитання", documents))
+
+    request = json.dumps(create.await_args.kwargs, ensure_ascii=False)
+    rows = [f"{item.name} [D{item.id}]" for item in documents]
+    assert selection_catalog(create.await_args) == rows
+    assert all(request.count(row) == 1 for row in rows)
+    assert "Повний текст документа номер" not in request
+
+
+def test_identical_filenames_are_resolved_by_their_document_ids() -> None:
+    documents = [
+        document(7, "Однакова назва.txt", "Необране старе правило."),
+        document(42, "Однакова назва.txt", "Обране нове правило."),
+    ]
+    service, create = assistant(
+        response(selection_payload(documents[1])),
+        response(payload(document_ids=[42], text="Обране нове правило.")),
     )
-    assert "Неактивний.txt" not in catalog
-    assert "Порожній.txt" not in catalog
+
+    reply = asyncio.run(service.answer("Яке правило?", documents))
+
+    assert reply.text == (
+        "Обране нове правило.\n\n— з документа «Однакова назва»"
+    )
+    selection_call, answer_call = create.await_args_list
+    catalog = selection_catalog(selection_call)
+    assert "Однакова назва.txt [D7]" in catalog
+    assert "Однакова назва.txt [D42]" in catalog
+    answer = messages_text(answer_call)
+    assert "[D42] Однакова назва.txt" in answer
+    assert "Обране нове правило." in answer
+    assert "Необране старе правило." not in answer
+    schema = answer_call.kwargs["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["document_ids"]["items"] == {
+        "type": "integer", "enum": [42]
+    }
+
+
+def test_selection_catalog_uses_normalized_filenames() -> None:
+    source = document(
+        12, "  Загальні  правила\n зборів.txt  ", "Обрані правила зборів."
+    )
+    service, create = assistant(
+        response(selection_payload(source)),
+        response(payload(document_ids=[12], text="Обрані правила зборів.")),
+    )
+
+    reply = asyncio.run(service.answer("Які правила зборів?", [source]))
+
+    assert reply.text.endswith("— з документа «Загальні правила зборів»")
+    assert "Загальні правила зборів.txt [D12]" in selection_catalog(
+        create.await_args_list[0]
+    )
 
 
 @pytest.mark.parametrize("documents", [
@@ -206,7 +300,7 @@ def test_final_answer_cites_only_actual_subset_of_selected_documents() -> None:
         document(2, "Друге джерело.docx", "Друге джерело."),
     ]
     service, create = assistant(
-        response(payload(document_ids=[1, 2])),
+        response(selection_payload(*documents)),
         response(payload(
             document_ids=[2], text="Відповідь із другого джерела."
         )),
@@ -251,13 +345,13 @@ def test_final_answer_cites_only_actual_subset_of_selected_documents() -> None:
 def test_single_source_uses_a_natural_title_without_file_extension(
     filename: str, title: str,
 ) -> None:
+    source = document(1, filename, "Синтетичні правила зборів.")
     service, create = assistant(
-        response(payload()), response(payload(text="Відповідь із джерела.")),
+        response(selection_payload(source)),
+        response(payload(text="Відповідь із джерела.")),
     )
 
-    reply = asyncio.run(service.answer(
-        "Які правила?", [document(1, filename, "Синтетичні правила зборів.")]
-    ))
+    reply = asyncio.run(service.answer("Які правила?", [source]))
 
     assert reply.text == f"Відповідь із джерела.\n\n— з документа {title}"
     assert create.await_count == 2
@@ -271,7 +365,7 @@ def test_multiple_sources_use_plural_label_and_each_actual_title() -> None:
         document(2, "Розклад зборів.DOCX", "Збори відбуваються у вівторок."),
     ]
     service, create = assistant(
-        response(payload(document_ids=[1, 2])),
+        response(selection_payload(*documents)),
         response(payload(document_ids=[1, 2], text="Умови зборів та внеску.")),
     )
 
@@ -291,13 +385,13 @@ def test_multiple_sources_use_plural_label_and_each_actual_title() -> None:
 def test_final_response_can_decline_or_clarify_without_source_labels(
     status: str, text: str, clarification: bool,
 ) -> None:
+    source = document(1, "Дійсна назва.txt", "Дійсний текст.")
     service, create = assistant(
-        response(payload()), response(payload(status, [], text)),
+        response(selection_payload(source)),
+        response(payload(status, [], text)),
     )
 
-    reply = asyncio.run(service.answer(
-        "Питання", [document(1, "Дійсна назва.txt", "Дійсний текст.")]
-    ))
+    reply = asyncio.run(service.answer("Питання", [source]))
 
     assert reply.needs_clarification is clarification
     assert reply.text == (text if clarification else NOT_FOUND)
@@ -309,15 +403,18 @@ def test_final_response_can_decline_or_clarify_without_source_labels(
     "not JSON",
     "[]",
     "null",
-    {"status": "unknown", "document_ids": [1], "text": "Текст"},
-    {"status": "answer", "document_ids": "1", "text": "Текст"},
-    {"status": "answer", "document_ids": [True], "text": "Текст"},
-    {"status": "answer", "document_ids": [1.0], "text": "Текст"},
-    {"status": "answer", "document_ids": [1, 1], "text": "Текст"},
-    {"status": "answer", "document_ids": [999], "text": "Текст"},
-    {"status": "answer", "document_ids": [], "text": "Текст"},
-    {"status": "answer", "document_ids": [1], "text": 42},
-    {"status": "answer", "document_ids": [1]},
+    {"status": "unknown", "document_ids": [], "text": "Текст"},
+    {"status": "answer", "document_ids": [1], "text": ""},
+    {"status": "selected", "document_ids": "1", "text": ""},
+    {"status": "selected", "document_ids": ["1"], "text": ""},
+    {"status": "selected", "document_ids": ["Правила.txt [D1]"], "text": ""},
+    {"status": "selected", "document_ids": [True], "text": ""},
+    {"status": "selected", "document_ids": [1.0], "text": ""},
+    {"status": "selected", "document_ids": [1, 1], "text": ""},
+    {"status": "selected", "document_ids": [999], "text": ""},
+    {"status": "selected", "document_ids": [], "text": ""},
+    {"status": "selected", "document_ids": [1], "text": 42},
+    {"status": "selected", "document_ids": [1]},
     {"status": "clarify", "document_ids": [], "text": " \n "},
 ])
 def test_invalid_selection_never_reaches_answer_request(invalid: Any) -> None:
@@ -336,7 +433,7 @@ def test_selector_cannot_choose_more_than_three_documents() -> None:
         document(index, f"Правила {index}.txt", f"Текст {index}.")
         for index in range(1, 5)
     ]
-    service, create = assistant(response(payload(document_ids=[1, 2, 3, 4])))
+    service, create = assistant(response(selection_payload(*documents)))
 
     with pytest.raises(llm.AssistantError):
         asyncio.run(service.answer("Питання", documents))
@@ -348,10 +445,17 @@ def test_selector_cannot_choose_more_than_three_documents() -> None:
     "not JSON",
     payload(text=" \n "),
     payload(document_ids=[True]),
+    payload(document_ids=[1.0]),
     payload(document_ids=[1, 1]),
     payload(document_ids=[2]),
     payload(document_ids=[999]),
     payload(document_ids=[]),
+    {
+        "status": "answer", "document_ids": ["Обраний.txt [D1]"],
+        "text": "Текст",
+    },
+    {"status": "answer", "document_ids": ["1"], "text": "Текст"},
+    {"status": "selected", "document_ids": [1], "text": "Текст"},
 ])
 def test_invalid_answer_cannot_claim_an_unselected_or_invalid_source(
     invalid: Any,
@@ -360,7 +464,9 @@ def test_invalid_answer_cannot_claim_an_unselected_or_invalid_source(
         document(1, "Обраний.txt", "Відомий факт."),
         document(2, "Необраний.txt", "Інший факт."),
     ]
-    service, create = assistant(response(payload()), response(invalid))
+    service, create = assistant(
+        response(selection_payload(documents[0])), response(invalid)
+    )
 
     with pytest.raises(llm.AssistantError):
         asyncio.run(service.answer("Питання", documents))
@@ -372,15 +478,17 @@ def test_invalid_answer_cannot_claim_an_unselected_or_invalid_source(
 def test_truncated_model_response_is_rejected_even_when_json_is_valid(
     phase: str,
 ) -> None:
-    responses = [response(payload(), finish_reason="length")]
+    source = document(1, "Правила.txt", "Архівний текст.")
+    responses = [response(
+        selection_payload(source) if phase == "selection" else payload(),
+        finish_reason="length",
+    )]
     if phase == "answer":
-        responses.insert(0, response(payload()))
+        responses.insert(0, response(selection_payload(source)))
     service, create = assistant(*responses)
 
     with pytest.raises(llm.AssistantError):
-        asyncio.run(service.answer(
-            "Питання", [document(1, "Правила.txt", "Архівний текст.")]
-        ))
+        asyncio.run(service.answer("Питання", [source]))
 
     assert create.await_count == len(responses)
 
@@ -405,12 +513,13 @@ def test_selected_texts_over_budget_are_not_silently_dropped_or_truncated(
 ) -> None:
     estimates = iter([100, 10_000])
     monkeypatch.setattr(llm, "_request_tokens", lambda *args: next(estimates))
-    service, create = assistant(response(payload(document_ids=[1, 2])))
-
-    reply = asyncio.run(service.answer("Питання", [
+    documents = [
         document(1, "Перше джерело.txt", "Перший повний текст."),
         document(2, "Друге джерело.txt", "Другий повний текст."),
-    ]))
+    ]
+    service, create = assistant(response(selection_payload(*documents)))
+
+    reply = asyncio.run(service.answer("Питання", documents))
 
     assert reply.needs_clarification
     assert reply.text.strip()
@@ -434,7 +543,9 @@ def test_api_failures_have_safe_messages_and_suppress_sensitive_traceback(
     )
     responses = [error]
     if phase == "answer":
-        responses.insert(0, response(payload()))
+        responses.insert(0, response(selection_payload(
+            document(1, "Правила.txt", "Текст правил.")
+        )))
     service, create = assistant(*responses)
 
     with pytest.raises(llm.AssistantError) as caught:

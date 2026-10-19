@@ -14,7 +14,7 @@ def test_groq_model_defaults_and_secret_is_not_in_repr(
     settings = load_llm_settings()
 
     assert settings.api_key == "example-secret"
-    assert settings.model == "openai/gpt-oss-20b"
+    assert settings.model == "openai/gpt-oss-120b"
     assert "example-secret" not in repr(settings)
 
 

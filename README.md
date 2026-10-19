@@ -23,7 +23,7 @@ an answer with source names. Documents persist in SQLite and a Docker volume.
    |---|---|
    | `BOT_TOKEN` | Telegram token from BotFather |
    | `GROQ_API_KEY` | Groq API key |
-   | `GROQ_MODEL` | `openai/gpt-oss-20b` (default) or `openai/gpt-oss-120b` |
+   | `GROQ_MODEL` | `openai/gpt-oss-120b` (default) or `openai/gpt-oss-20b` |
    | `GOOGLE_API_KEY` | Google Drive API key |
    | `DRIVE_FOLDER_ID` | Folder ID after `/folders/` in its URL |
    | `DATA_DIR` | Keep `/app/data` for Docker |
@@ -35,7 +35,8 @@ an answer with source names. Documents persist in SQLite and a Docker volume.
    ```
 
 Open the bot in Telegram and send `/start`, then ask a question in Ukrainian.
-Include the place name when relevant; the bot asks for clarification if needed.
+You do not need to know document titles. Include the place name for local
+rules; the bot asks for clarification if needed.
 Run one instance per bot token. Press `Ctrl+C` to stop it; run
 `docker compose down` to remove the stopped container.
 Rebuild after changing code or configuration.
@@ -83,3 +84,7 @@ Alternatively, run tests in the built Docker image:
 ```sh
 docker compose run --rm --no-deps -T --volume "./tests:/app/tests:ro" bot python -m pytest -q -p no:cacheprovider --basetemp=/tmp/forest-archive-tests /app/tests
 ```
+
+To enable optional Groq checks on fictional documents, add
+`-e RUN_GROQ_LIVE=1` after `run` and target `/app/tests/test_llm_live.py`.
+These checks send API requests and pause between cases.
