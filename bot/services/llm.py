@@ -174,6 +174,7 @@ class InvalidReply(AssistantError):
 class AssistantReply:
     text: str
     needs_clarification: bool = False
+    source_ids: tuple[int, ...] = ()
 
 
 class ArchiveAssistant:
@@ -203,7 +204,8 @@ class ArchiveAssistant:
         available = {
             document.id: document
             for document in sorted(documents, key=lambda item: item.id)
-            if document.active and document.text.strip()
+            if document.active and document.deleted_at is None
+            and document.text.strip()
         }
         if not available:
             return AssistantReply(NOT_FOUND)
@@ -328,7 +330,12 @@ class ArchiveAssistant:
         reply = f"{text}\n\n— {source_label} {sources}"
         if len(reply.encode("utf-16-le")) // 2 > 4000:
             raise InvalidReply("reply_too_long")
-        return AssistantReply(reply)
+        return AssistantReply(
+            reply,
+            source_ids=tuple(
+                document.id for document in cited_sources.values()
+            ),
+        )
 
     async def _phase(
         self,

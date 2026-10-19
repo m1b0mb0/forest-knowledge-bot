@@ -5,6 +5,7 @@ import logging
 import os
 import sqlite3
 import tempfile
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ class Document:
     owner_id: int | None = None
     owner_name: str | None = None
     uploaded_at: str | None = None
+    deleted_at: str | None = None
 
 
 class Store:
@@ -59,6 +61,7 @@ class Store:
                     owner_id INTEGER,
                     owner_name TEXT,
                     uploaded_at TEXT,
+                    deleted_at TEXT,
                     UNIQUE (source, source_id)
                 );
                 """
@@ -72,6 +75,7 @@ class Store:
                     ("owner_id", "INTEGER"),
                     ("owner_name", "TEXT"),
                     ("uploaded_at", "TEXT"),
+                    ("deleted_at", "TEXT"),
                 ):
                     if name not in columns:
                         connection.execute(
@@ -245,24 +249,103 @@ class Store:
             rows = connection.execute(
                 "SELECT * FROM documents ORDER BY id"
             ).fetchall()
-        return [
-            Document(
-                id=row["id"],
-                source=row["source"],
-                source_id=row["source_id"],
-                name=row["name"],
-                relative_path=Path(row["relative_path"]),
-                text=row["text"],
-                modified_at=row["modified_at"],
-                created_at=row["created_at"],
-                imported_at=row["imported_at"],
-                active=bool(row["active"]),
-                owner_id=row["owner_id"],
-                owner_name=row["owner_name"],
-                uploaded_at=row["uploaded_at"],
+        return [self._document(row) for row in rows]
+
+    def list_telegram_documents(self, owner_id: int) -> list[Document]:
+        """Return an owner's undeleted uploads, newest first."""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM documents
+                WHERE source = 'telegram' AND owner_id = ?
+                    AND deleted_at IS NULL
+                ORDER BY id DESC
+                """,
+                (owner_id,),
+            ).fetchall()
+        return [self._document(row) for row in rows]
+
+    def are_documents_active(self, document_ids: Sequence[int]) -> bool:
+        """Check whether every cited document is still available."""
+        identifiers = set(document_ids)
+        if not identifiers:
+            return True
+        placeholders = ", ".join("?" for _ in identifiers)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) FROM documents WHERE id IN ({placeholders}) "
+                "AND active = 1 AND deleted_at IS NULL",
+                tuple(identifiers),
+            ).fetchone()
+        return int(row[0]) == len(identifiers)
+
+    def delete_telegram_document(
+        self, document_id: int, owner_id: int,
+    ) -> bool:
+        """Remove an owner's upload while retaining its replay identity.
+
+        Authorization and the tombstone update share one transaction. The
+        original is removed only after that transaction commits, so a failed
+        database write leaves both the document and its original intact.
+        """
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                    SELECT relative_path FROM documents
+                    WHERE id = ? AND source = 'telegram' AND owner_id = ?
+                        AND deleted_at IS NULL
+                    """,
+                (document_id, owner_id),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                """
+                    UPDATE documents SET active = 0, text = '', deleted_at = ?
+                    WHERE id = ? AND source = 'telegram' AND owner_id = ?
+                        AND deleted_at IS NULL
+                    """,
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    document_id, owner_id,
+                ),
             )
-            for row in rows
-        ]
+
+        destination = self.data_dir / row["relative_path"]
+        try:
+            resolved = destination.resolve()
+            directory = self.data_dir / "documents"
+            if (
+                resolved == directory
+                or not resolved.is_relative_to(directory)
+            ):
+                logger.warning("Refusing to remove an unsafe document path.")
+                return True
+        except (OSError, RuntimeError):
+            logger.warning("Could not resolve the deleted document's path.")
+            return True
+        self._remove_file(destination)
+        return True
+
+    @staticmethod
+    def _document(row: sqlite3.Row) -> Document:
+        return Document(
+            id=row["id"],
+            source=row["source"],
+            source_id=row["source_id"],
+            name=row["name"],
+            relative_path=Path(row["relative_path"]),
+            text=row["text"],
+            modified_at=row["modified_at"],
+            created_at=row["created_at"],
+            imported_at=row["imported_at"],
+            active=bool(row["active"]),
+            owner_id=row["owner_id"],
+            owner_name=row["owner_name"],
+            uploaded_at=row["uploaded_at"],
+            deleted_at=row["deleted_at"],
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)

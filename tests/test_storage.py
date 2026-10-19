@@ -223,6 +223,7 @@ def test_initialize_migrates_old_schema_without_changing_documents(
     assert document.owner_id is None
     assert document.owner_name is None
     assert document.uploaded_at is None
+    assert document.deleted_at is None
     assert (tmp_path / document.relative_path).read_bytes() == (
         b"legacy content"
     )
@@ -425,3 +426,311 @@ def test_telegram_upload_rejects_naive_timestamp_before_persisting(
 
     assert store.list_documents() == []
     assert list((tmp_path / "documents").iterdir()) == []
+
+
+def _upload(
+    store: Store, source_id: str = "10:25", owner_id: int = 100,
+) -> int:
+    return store.add_telegram_document(
+        source_id, "Поради.txt", b"shared content", "Shared advice",
+        owner_id, f"Sender {owner_id}",
+        datetime(2026, 10, 19, 10, tzinfo=timezone.utc),
+    )
+
+
+def test_own_upload_list_is_isolated_and_keeps_inactive_documents(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    first = _upload(store)
+    other = _upload(store, "20:25", 200)
+    second = _upload(store, "10:26")
+    inactive = _upload(store, "10:27")
+    deleted = _upload(store, "10:28")
+    drive = store.upsert_drive_document(
+        "drive-1", "drive.txt", b"drive", "Drive advice", None,
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE documents SET active = 0 WHERE id = ?", (inactive,),
+        )
+        connection.execute(
+            "UPDATE documents SET owner_id = 100 WHERE id = ?", (drive,),
+        )
+    assert store.delete_telegram_document(deleted, 100) is True
+
+    assert [doc.id for doc in store.list_telegram_documents(100)] == [
+        inactive, second, first,
+    ]
+    assert [doc.id for doc in store.list_telegram_documents(200)] == [other]
+    assert store.list_telegram_documents(999) == []
+
+
+def test_deleting_own_upload_clears_content_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    document_id = _upload(store)
+    original = store.list_documents()[0]
+
+    assert store.delete_telegram_document(document_id, 100) is True
+
+    reopened = Store(tmp_path)
+    reopened.initialize()
+    deleted = reopened.list_documents()[0]
+    assert reopened.list_telegram_documents(100) == []
+    assert deleted.id == original.id
+    assert deleted.source == original.source == "telegram"
+    assert deleted.source_id == original.source_id
+    assert deleted.owner_id == original.owner_id == 100
+    assert deleted.owner_name == original.owner_name
+    assert deleted.uploaded_at == original.uploaded_at
+    assert deleted.active is False
+    assert deleted.text == ""
+    assert deleted.deleted_at is not None
+    assert datetime.fromisoformat(deleted.deleted_at).utcoffset() == (
+        timedelta(0)
+    )
+    assert not (tmp_path / original.relative_path).exists()
+
+
+@pytest.mark.parametrize("target", ["other-owner", "drive", "missing"])
+def test_delete_denies_foreign_drive_and_missing_documents(
+    tmp_path: Path, target: str,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    _upload(store)
+    foreign = _upload(store, "20:25", 200)
+    drive = store.upsert_drive_document(
+        "drive-1", "drive.txt", b"drive", "Drive advice", None,
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE documents SET owner_id = 100 WHERE id = ?", (drive,),
+        )
+    originals = store.list_documents()
+    original_files = {
+        doc.relative_path: (tmp_path / doc.relative_path).read_bytes()
+        for doc in originals
+    }
+    identifier = {"other-owner": foreign, "drive": drive, "missing": 999}[
+        target
+    ]
+
+    assert store.delete_telegram_document(identifier, 100) is False
+
+    assert store.list_documents() == originals
+    assert {
+        doc.relative_path: (tmp_path / doc.relative_path).read_bytes()
+        for doc in originals
+    } == original_files
+
+
+def test_repeated_delete_and_upload_replay_do_not_restore_content(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    document_id = _upload(store)
+    assert store.delete_telegram_document(document_id, 100) is True
+    tombstone = store.list_documents()[0]
+
+    assert store.delete_telegram_document(document_id, 100) is False
+    replayed_id = store.add_telegram_document(
+        "10:25", "Changed.txt", b"changed", "Changed advice", 200,
+        "Other sender", datetime(2026, 10, 20, tzinfo=timezone.utc),
+    )
+
+    assert replayed_id == document_id
+    assert store.list_documents() == [tombstone]
+    assert store.list_telegram_documents(100) == []
+    assert list((tmp_path / "documents").iterdir()) == []
+
+
+def test_delete_failure_preserves_document_and_original(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    document_id = _upload(store)
+    original = store.list_documents()[0]
+    with sqlite3.connect(store.database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER reject_delete
+            BEFORE UPDATE ON documents
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated deletion failure');
+            END;
+            """
+        )
+
+    with pytest.raises(
+        sqlite3.IntegrityError, match="simulated deletion failure",
+    ):
+        store.delete_telegram_document(document_id, 100)
+
+    assert store.list_documents() == [original]
+    assert store.list_telegram_documents(100) == [original]
+    assert (tmp_path / original.relative_path).read_bytes() == (
+        b"shared content"
+    )
+
+
+def test_original_cleanup_failure_does_not_restore_deleted_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    document_id = _upload(store)
+    original = store.list_documents()[0]
+    original_path = tmp_path / original.relative_path
+    original_unlink = Path.unlink
+
+    def denied_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == original_path:
+            raise PermissionError("simulated filesystem denial")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", denied_unlink)
+
+    assert store.delete_telegram_document(document_id, 100) is True
+
+    assert store.list_telegram_documents(100) == []
+    assert store.list_documents()[0].text == ""
+    assert store.list_documents()[0].active is False
+    assert original_path.is_file()
+    assert "Could not remove obsolete archive file" in caplog.text
+
+
+def test_delete_preserves_identical_uploads_and_drive_originals(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    deleted_id = _upload(store)
+    _upload(store, "20:25", 200)
+    _upload(store, "10:26")
+    store.upsert_drive_document(
+        "10:25", "drive.txt", b"shared content", "Drive advice", None,
+    )
+    originals = store.list_documents()[1:]
+
+    assert store.delete_telegram_document(deleted_id, 100) is True
+
+    assert store.list_documents()[1:] == originals
+    assert all(
+        (tmp_path / doc.relative_path).read_bytes() == b"shared content"
+        for doc in originals
+    )
+
+
+@pytest.mark.parametrize("path_kind", ["relative", "absolute", "database"])
+def test_delete_never_unlinks_a_path_outside_the_documents_directory(
+    tmp_path: Path, path_kind: str,
+) -> None:
+    store = Store(tmp_path / "data")
+    store.initialize()
+    document_id = _upload(store)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"must survive")
+    tampered_path = {
+        "relative": "../outside.bin",
+        "absolute": str(outside.resolve()),
+        "database": "archive.sqlite3",
+    }[path_kind]
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE documents SET relative_path = ? WHERE id = ?",
+            (tampered_path, document_id),
+        )
+
+    assert store.delete_telegram_document(document_id, 100) is True
+
+    assert outside.read_bytes() == b"must survive"
+    assert store.database_path.is_file()
+    assert store.list_documents()[0].active is False
+    assert store.list_documents()[0].text == ""
+
+
+def test_initialize_migrates_the_telegram_upload_schema(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    original_path = tmp_path / "documents" / "upload.bin"
+    original_path.parent.mkdir()
+    original_path.write_bytes(b"uploaded content")
+    timestamp = "2026-10-19T10:00:00+00:00"
+    with sqlite3.connect(store.database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY, source TEXT NOT NULL,
+                source_id TEXT NOT NULL, name TEXT NOT NULL,
+                relative_path TEXT NOT NULL, text TEXT NOT NULL,
+                modified_at TEXT, created_at TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                owner_id INTEGER, owner_name TEXT, uploaded_at TEXT,
+                UNIQUE (source, source_id)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?)",
+            (
+                42, "telegram", "10:25", "upload.txt",
+                "documents/upload.bin", "Uploaded advice", None,
+                timestamp, timestamp, 1, 100, "Sender", timestamp,
+            ),
+        )
+
+    store.initialize()
+    store.initialize()
+
+    document = store.list_telegram_documents(100)[0]
+    assert document.id == 42
+    assert document.text == "Uploaded advice"
+    assert document.owner_name == "Sender"
+    assert document.uploaded_at == timestamp
+    assert document.deleted_at is None
+    assert original_path.read_bytes() == b"uploaded content"
+
+
+def test_active_document_check_accepts_empty_and_duplicate_identifiers(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    uploaded = _upload(store)
+    drive = store.upsert_drive_document(
+        "drive-1", "drive.txt", b"drive", "Drive advice", None,
+    )
+
+    assert store.are_documents_active(()) is True
+    assert store.are_documents_active((uploaded, drive, uploaded)) is True
+    assert store.are_documents_active((uploaded, 999)) is False
+
+
+def test_active_document_check_rejects_inactive_and_deleted_sources(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.initialize()
+    active = _upload(store)
+    inactive = _upload(store, "10:26")
+    deleted = _upload(store, "10:27")
+    assert store.delete_telegram_document(deleted, 100) is True
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE documents SET active = 0 WHERE id = ?", (inactive,),
+        )
+
+    assert store.are_documents_active((active,)) is True
+    assert store.are_documents_active((active, inactive)) is False
+    assert store.are_documents_active((active, deleted)) is False

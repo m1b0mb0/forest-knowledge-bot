@@ -52,6 +52,9 @@ Keep secrets in the local `.env`, which is excluded from Git and the Docker imag
 - Send a PDF, DOCX or UTF-8 TXT as a Telegram document to add it to the shared
   knowledge base. Uploaded files are available to every bot user. Answers cite
   the filename, sender and time sent (UTC).
+- Use `/my_documents` to list your uploads and `/delete <id>` to delete one.
+  Only the sender can delete their Telegram files; deleted content is excluded
+  from answers. Google Drive documents cannot be deleted through the bot.
 - PyMuPDF extracts PDF text and uses Ukrainian and English OCR data for pages
   without embedded text. OCR accuracy depends on scan quality; images on pages
   that also contain embedded text are not recognized.
