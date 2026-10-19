@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata \
+    TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
 
 WORKDIR /app
 
@@ -14,9 +15,10 @@ RUN apt-get update \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "import tiktoken; tiktoken.get_encoding('o200k_base')" \
     && useradd --create-home --uid 10001 bot \
     && mkdir -p /app/data \
-    && chown bot:bot /app/data
+    && chown -R bot:bot /app/data /opt/tiktoken-cache
 
 COPY bot/ ./bot/
 

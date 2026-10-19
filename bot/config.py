@@ -17,6 +17,27 @@ class ArchiveSettings:
     data_dir: Path = Path("data")
 
 
+@dataclass(frozen=True)
+class LLMSettings:
+    """Groq credentials and a model with the supported token budget."""
+
+    api_key: str = field(repr=False)
+    model: str = "openai/gpt-oss-20b"
+
+
+def load_llm_settings() -> LLMSettings:
+    """Validate Groq configuration without including secrets in errors."""
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("GROQ_API_KEY is missing.")
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+    if model not in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+        raise ValueError(
+            "GROQ_MODEL must be openai/gpt-oss-20b or openai/gpt-oss-120b."
+        )
+    return LLMSettings(api_key=api_key, model=model)
+
+
 def load_archive_settings() -> ArchiveSettings:
     """Require public-folder access and a local persistent data directory."""
     folder_id = os.getenv("DRIVE_FOLDER_ID", "").strip()
