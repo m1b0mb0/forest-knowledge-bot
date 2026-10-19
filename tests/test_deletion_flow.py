@@ -6,10 +6,9 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, Mock
+from typing import cast
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram.types import Message
@@ -17,31 +16,15 @@ from aiogram.types import Message
 from bot.handlers import text_handler
 from bot.services import llm
 from bot.storage import Document, Store
+from tests.helpers import completion, make_client
+
+pytestmark = pytest.mark.usefixtures("offline_token_counts", "typing")
 
 FACT = "Майстерня відкрита щовівторка о 17:30."
 QUESTION = "Коли відкрита майстерня?"
 ARCHIVE_CHANGED = (
     "Архів змінився під час підготовки відповіді. Повтори запитання."
 )
-
-
-@pytest.fixture(autouse=True)
-def offline_services(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Avoid tokenizer downloads and background Telegram requests."""
-    monkeypatch.setattr(llm, "_count_tokens", lambda value: len(value.split()))
-    context = MagicMock()
-    context.__aenter__ = AsyncMock()
-    context.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(
-        "bot.handlers.ChatActionSender.typing", Mock(return_value=context)
-    )
-
-
-@pytest.fixture
-def store(tmp_path: Path) -> Store:
-    instance = Store(tmp_path)
-    instance.initialize()
-    return instance
 
 
 def upload(store: Store, source_id: str = "10:20") -> int:
@@ -66,16 +49,6 @@ def message() -> Message:
     ))
 
 
-def completion(payload: dict[str, Any]) -> SimpleNamespace:
-    return SimpleNamespace(
-        choices=[SimpleNamespace(
-            finish_reason="stop",
-            message=SimpleNamespace(content=json.dumps(payload)),
-        )],
-        usage=None,
-    )
-
-
 def selection(*document_ids: int) -> SimpleNamespace:
     return completion({
         "status": "selected", "document_ids": list(document_ids), "text": "",
@@ -92,13 +65,8 @@ def answer(*source_ids: int) -> SimpleNamespace:
     })
 
 
-def assistant(
-    create: AsyncMock,
-) -> llm.ArchiveAssistant:
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
-    )
-    return llm.ArchiveAssistant(client, "offline-test-model")
+def assistant(create: AsyncMock) -> llm.ArchiveAssistant:
+    return llm.ArchiveAssistant(make_client(create), "offline-test-model")
 
 
 def test_reply_tracks_unique_cited_database_ids_not_selection_ids(

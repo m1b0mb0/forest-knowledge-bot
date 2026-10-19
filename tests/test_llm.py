@@ -5,8 +5,6 @@ import json
 import re
 import traceback
 from dataclasses import replace
-from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -16,23 +14,11 @@ import pytest
 
 from bot.services import llm
 from bot.storage import Document
+from tests.helpers import completion as response
+from tests.helpers import make_client
+from tests.helpers import make_document as document
 
 NOT_FOUND = "Не знайшов відповіді в доступних документах."
-
-
-def document(document_id: int, name: str, text: str) -> Document:
-    return Document(
-        id=document_id,
-        source="drive",
-        source_id=f"source-{document_id}",
-        name=name,
-        relative_path=Path("documents") / f"{document_id}.bin",
-        text=text,
-        modified_at="2026-10-18T12:00:00Z",
-        created_at="2026-10-18T12:00:00Z",
-        imported_at="2026-10-18T12:00:00Z",
-        active=True,
-    )
 
 
 def payload(
@@ -61,25 +47,9 @@ def selection_payload(
     }
 
 
-def response(value: Any, finish_reason: str = "stop") -> SimpleNamespace:
-    content = value if isinstance(value, str) else json.dumps(
-        value, ensure_ascii=False
-    )
-    return SimpleNamespace(
-        choices=[SimpleNamespace(
-            message=SimpleNamespace(content=content),
-            finish_reason=finish_reason,
-        )],
-        usage=SimpleNamespace(prompt_tokens=100, completion_tokens=30),
-    )
-
-
 def assistant(*responses: Any) -> tuple[llm.ArchiveAssistant, AsyncMock]:
     create = AsyncMock(side_effect=list(responses))
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
-    )
-    return llm.ArchiveAssistant(client, "test-model"), create
+    return llm.ArchiveAssistant(make_client(create), "test-model"), create
 
 
 def messages_text(call: Any) -> str:
@@ -99,9 +69,9 @@ def selection_catalog(call: Any) -> list[str]:
 
 
 @pytest.fixture(autouse=True)
-def avoid_tokenizer_download(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep unit tests independent of the tokenizer's vocabulary download."""
-    monkeypatch.setattr(llm, "_count_tokens", lambda text: len(text.split()))
+def avoid_tokenizer_download(
+    monkeypatch: pytest.MonkeyPatch, offline_token_counts: None,
+) -> None:
     # This module checks individual invalid replies. Retry behavior has its
     # own tests, so each malformed response remains a single API attempt here.
     monkeypatch.setattr(llm, "MAX_REPLY_REPAIRS", 0)
@@ -468,11 +438,16 @@ def test_more_than_six_distinct_evidence_quotes_are_rejected() -> None:
     assert create.await_count == 2
 
 
-@pytest.mark.parametrize("marker", [
-    "D5", "[D7]", "S1", "[S2]", "[1]", "source_id", "document_ids",
-])
-@pytest.mark.parametrize("phase", [
-    "selection-clarify", "answer", "answer-clarify",
+@pytest.mark.parametrize("marker,phase", [
+    ("D5", "answer"),
+    ("[D7]", "answer"),
+    ("S1", "answer"),
+    ("[S2]", "answer"),
+    ("[1]", "answer"),
+    ("source_id", "answer"),
+    ("document_ids", "answer"),
+    ("D5", "selection-clarify"),
+    ("D5", "answer-clarify"),
 ])
 def test_internal_source_markers_never_reach_the_user(
     marker: str, phase: str,

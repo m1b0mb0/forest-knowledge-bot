@@ -7,7 +7,7 @@ from io import BytesIO
 from pathlib import PurePath
 
 import aiohttp
-from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
 
 from bot.services.documents import (
@@ -82,13 +82,7 @@ class UploadService:
                         chunk_size=64 * 1024,
                     )
                     content = destination.getvalue()
-        except (
-            TelegramAPIError,
-            TelegramNetworkError,
-            aiohttp.ClientError,
-            TimeoutError,
-            OSError,
-        ):
+        except (TelegramAPIError, aiohttp.ClientError, OSError):
             raise UploadError(DOWNLOAD_ERROR) from None
 
         self._check_size(len(content))

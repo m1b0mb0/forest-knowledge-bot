@@ -19,16 +19,14 @@ def test_initialize_is_repeatable(tmp_path: Path) -> None:
 
 
 def test_document_and_metadata_survive_new_store_instance(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     content = "Правила лісу".encode("utf-8")
 
     document_id = store.upsert_drive_document(
         "file-1", "rules.txt", content, "Правила лісу", "2026-10-18T10:00:00Z"
     )
-    reopened = Store(tmp_path)
+    reopened = Store(store.data_dir)
     document = reopened.list_documents()[0]
 
     assert document.id == document_id
@@ -41,14 +39,12 @@ def test_document_and_metadata_survive_new_store_instance(
     assert datetime.fromisoformat(document.created_at).utcoffset() is not None
     assert document.created_at == document.imported_at
     assert not document.relative_path.is_absolute()
-    assert (tmp_path / document.relative_path).read_bytes() == content
+    assert (store.data_dir / document.relative_path).read_bytes() == content
 
 
 def test_reimport_updates_existing_document_without_duplicates(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     first_id = store.upsert_drive_document(
         "file-1", "old.txt", b"old", "old", None
     )
@@ -67,8 +63,8 @@ def test_reimport_updates_existing_document_without_duplicates(
     assert updated.modified_at == "2026-10-18T11:00:00Z"
     assert updated.created_at == original.created_at
     assert updated.imported_at >= original.imported_at
-    assert (tmp_path / updated.relative_path).read_bytes() == b"new"
-    assert not (tmp_path / original.relative_path).exists()
+    assert (store.data_dir / updated.relative_path).read_bytes() == b"new"
+    assert not (store.data_dir / original.relative_path).exists()
 
 
 def test_untrusted_name_and_source_id_cannot_escape_data_directory(
@@ -92,13 +88,11 @@ def test_untrusted_name_and_source_id_cannot_escape_data_directory(
 
 
 def test_database_failure_keeps_previous_document_and_original_file(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     store.upsert_drive_document("file-1", "old.txt", b"old", "old", None)
     original = store.list_documents()[0]
-    original_files = set((tmp_path / "documents").iterdir())
+    original_files = set((store.data_dir / "documents").iterdir())
 
     connection = sqlite3.connect(store.database_path)
     try:
@@ -120,18 +114,18 @@ def test_database_failure_keeps_previous_document_and_original_file(
         store.upsert_drive_document("file-1", "new.txt", b"new", "new", None)
 
     assert store.list_documents() == [original]
-    assert (tmp_path / original.relative_path).read_bytes() == b"old"
-    assert set((tmp_path / "documents").iterdir()) == original_files
+    assert (store.data_dir / original.relative_path).read_bytes() == b"old"
+    assert set((store.data_dir / "documents").iterdir()) == original_files
 
 
 def test_database_failure_keeps_a_repaired_existing_original(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
-    store.upsert_drive_document("file-1", "rules.txt", b"original", "text", None)
+    store.upsert_drive_document(
+        "file-1", "rules.txt", b"original", "text", None,
+    )
     original = store.list_documents()[0]
-    original_path = tmp_path / original.relative_path
+    original_path = store.data_dir / original.relative_path
     original_path.write_bytes(b"")
     with sqlite3.connect(store.database_path) as connection:
         connection.executescript(
@@ -156,10 +150,8 @@ def test_database_failure_keeps_a_repaired_existing_original(
 
 
 def test_updating_one_document_preserves_another_with_identical_content(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     store.upsert_drive_document("file-1", "first.txt", b"same", "same", None)
     second_id = store.upsert_drive_document(
         "file-2", "second.txt", b"same", "same", None
@@ -171,7 +163,7 @@ def test_updating_one_document_preserves_another_with_identical_content(
 
     second = next(doc for doc in store.list_documents() if doc.id == second_id)
     assert second.text == "same"
-    assert (tmp_path / second.relative_path).read_bytes() == b"same"
+    assert (store.data_dir / second.relative_path).read_bytes() == b"same"
 
 
 def test_initialize_migrates_old_schema_without_changing_documents(
@@ -230,10 +222,8 @@ def test_initialize_migrates_old_schema_without_changing_documents(
 
 
 def test_telegram_upload_and_metadata_survive_reopening(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     sent_at = datetime(
         2026, 10, 19, 13, 25, tzinfo=timezone(timedelta(hours=3))
     )
@@ -247,7 +237,7 @@ def test_telegram_upload_and_metadata_survive_reopening(
         owner_name="Олена (@forest_reader)",
         uploaded_at=sent_at,
     )
-    reopened = Store(tmp_path)
+    reopened = Store(store.data_dir)
     reopened.initialize()
     document = reopened.list_documents()[0]
 
@@ -263,17 +253,15 @@ def test_telegram_upload_and_metadata_survive_reopening(
     assert document.active is True
     assert document.created_at == document.imported_at
     assert datetime.fromisoformat(document.created_at).utcoffset() is not None
-    assert (tmp_path / document.relative_path).read_bytes() == (
+    assert (store.data_dir / document.relative_path).read_bytes() == (
         "Нові поради".encode("utf-8")
     )
 
 
 @pytest.mark.parametrize("active", [True, False])
 def test_replayed_telegram_message_preserves_first_record(
-    tmp_path: Path, active: bool,
+    store: Store, active: bool,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     document_id = store.add_telegram_document(
         "10:25", "first.txt", b"first", "first text", 100, "First sender",
         datetime(2026, 10, 19, 10, tzinfo=timezone.utc),
@@ -284,7 +272,7 @@ def test_replayed_telegram_message_preserves_first_record(
             (int(active), document_id),
         )
     original = store.list_documents()[0]
-    original_files = set((tmp_path / "documents").iterdir())
+    original_files = set((store.data_dir / "documents").iterdir())
 
     repeated_id = store.add_telegram_document(
         "10:25", "changed.txt", b"changed", "changed text", 200,
@@ -293,15 +281,13 @@ def test_replayed_telegram_message_preserves_first_record(
 
     assert repeated_id == document_id
     assert store.list_documents() == [original]
-    assert set((tmp_path / "documents").iterdir()) == original_files
-    assert (tmp_path / original.relative_path).read_bytes() == b"first"
+    assert set((store.data_dir / "documents").iterdir()) == original_files
+    assert (store.data_dir / original.relative_path).read_bytes() == b"first"
 
 
 def test_matching_files_from_different_uploads_keep_separate_owners(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     sent_at = datetime(2026, 10, 19, tzinfo=timezone.utc)
 
     first_id = store.add_telegram_document(
@@ -319,16 +305,14 @@ def test_matching_files_from_different_uploads_keep_separate_owners(
     assert [document.owner_id for document in documents] == [100, 200, 100]
     assert len({document.relative_path for document in documents}) == 3
     assert all(
-        (tmp_path / document.relative_path).read_bytes() == b"same"
+        (store.data_dir / document.relative_path).read_bytes() == b"same"
         for document in documents
     )
 
 
 def test_telegram_upload_cannot_replace_matching_drive_source(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     drive_id = store.upsert_drive_document(
         "10:25", "same.txt", b"same", "same", None,
     )
@@ -347,15 +331,13 @@ def test_telegram_upload_cannot_replace_matching_drive_source(
     assert telegram.source == "telegram"
     assert telegram.owner_id == 100
     assert drive.relative_path != telegram.relative_path
-    assert (tmp_path / drive.relative_path).read_bytes() == b"same"
-    assert (tmp_path / telegram.relative_path).read_bytes() == b"same"
+    assert (store.data_dir / drive.relative_path).read_bytes() == b"same"
+    assert (store.data_dir / telegram.relative_path).read_bytes() == b"same"
 
 
 def test_telegram_database_failure_removes_only_the_new_original(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     sent_at = datetime(2026, 10, 19, tzinfo=timezone.utc)
     store.upsert_drive_document(
         "drive-1", "drive.txt", b"drive", "drive", None,
@@ -364,7 +346,7 @@ def test_telegram_database_failure_removes_only_the_new_original(
         "10:25", "first.txt", b"first", "first", 100, "First", sent_at,
     )
     originals = store.list_documents()
-    original_files = set((tmp_path / "documents").iterdir())
+    original_files = set((store.data_dir / "documents").iterdir())
     with sqlite3.connect(store.database_path) as connection:
         connection.executescript(
             """
@@ -386,9 +368,13 @@ def test_telegram_database_failure_removes_only_the_new_original(
         )
 
     assert store.list_documents() == originals
-    assert set((tmp_path / "documents").iterdir()) == original_files
-    assert (tmp_path / originals[0].relative_path).read_bytes() == b"drive"
-    assert (tmp_path / originals[1].relative_path).read_bytes() == b"first"
+    assert set((store.data_dir / "documents").iterdir()) == original_files
+    assert (store.data_dir / originals[0].relative_path).read_bytes() == (
+        b"drive"
+    )
+    assert (store.data_dir / originals[1].relative_path).read_bytes() == (
+        b"first"
+    )
 
 
 def test_telegram_filename_and_message_id_cannot_escape_data_directory(
@@ -413,11 +399,8 @@ def test_telegram_filename_and_message_id_cannot_escape_data_directory(
 
 
 def test_telegram_upload_rejects_naive_timestamp_before_persisting(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
-
     with pytest.raises(ValueError, match="timezone"):
         store.add_telegram_document(
             "10:25", "rules.txt", b"rules", "rules", 100, "Sender",
@@ -425,7 +408,7 @@ def test_telegram_upload_rejects_naive_timestamp_before_persisting(
         )
 
     assert store.list_documents() == []
-    assert list((tmp_path / "documents").iterdir()) == []
+    assert list((store.data_dir / "documents").iterdir()) == []
 
 
 def _upload(
@@ -439,10 +422,8 @@ def _upload(
 
 
 def test_own_upload_list_is_isolated_and_keeps_inactive_documents(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     first = _upload(store)
     other = _upload(store, "20:25", 200)
     second = _upload(store, "10:26")
@@ -468,16 +449,14 @@ def test_own_upload_list_is_isolated_and_keeps_inactive_documents(
 
 
 def test_deleting_own_upload_clears_content_and_survives_restart(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     document_id = _upload(store)
     original = store.list_documents()[0]
 
     assert store.delete_telegram_document(document_id, 100) is True
 
-    reopened = Store(tmp_path)
+    reopened = Store(store.data_dir)
     reopened.initialize()
     deleted = reopened.list_documents()[0]
     assert reopened.list_telegram_documents(100) == []
@@ -493,15 +472,13 @@ def test_deleting_own_upload_clears_content_and_survives_restart(
     assert datetime.fromisoformat(deleted.deleted_at).utcoffset() == (
         timedelta(0)
     )
-    assert not (tmp_path / original.relative_path).exists()
+    assert not (store.data_dir / original.relative_path).exists()
 
 
 @pytest.mark.parametrize("target", ["other-owner", "drive", "missing"])
 def test_delete_denies_foreign_drive_and_missing_documents(
-    tmp_path: Path, target: str,
+    store: Store, target: str,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     _upload(store)
     foreign = _upload(store, "20:25", 200)
     drive = store.upsert_drive_document(
@@ -513,7 +490,7 @@ def test_delete_denies_foreign_drive_and_missing_documents(
         )
     originals = store.list_documents()
     original_files = {
-        doc.relative_path: (tmp_path / doc.relative_path).read_bytes()
+        doc.relative_path: (store.data_dir / doc.relative_path).read_bytes()
         for doc in originals
     }
     identifier = {"other-owner": foreign, "drive": drive, "missing": 999}[
@@ -524,16 +501,14 @@ def test_delete_denies_foreign_drive_and_missing_documents(
 
     assert store.list_documents() == originals
     assert {
-        doc.relative_path: (tmp_path / doc.relative_path).read_bytes()
+        doc.relative_path: (store.data_dir / doc.relative_path).read_bytes()
         for doc in originals
     } == original_files
 
 
 def test_repeated_delete_and_upload_replay_do_not_restore_content(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     document_id = _upload(store)
     assert store.delete_telegram_document(document_id, 100) is True
     tombstone = store.list_documents()[0]
@@ -547,14 +522,12 @@ def test_repeated_delete_and_upload_replay_do_not_restore_content(
     assert replayed_id == document_id
     assert store.list_documents() == [tombstone]
     assert store.list_telegram_documents(100) == []
-    assert list((tmp_path / "documents").iterdir()) == []
+    assert list((store.data_dir / "documents").iterdir()) == []
 
 
 def test_delete_failure_preserves_document_and_original(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     document_id = _upload(store)
     original = store.list_documents()[0]
     with sqlite3.connect(store.database_path) as connection:
@@ -575,20 +548,18 @@ def test_delete_failure_preserves_document_and_original(
 
     assert store.list_documents() == [original]
     assert store.list_telegram_documents(100) == [original]
-    assert (tmp_path / original.relative_path).read_bytes() == (
+    assert (store.data_dir / original.relative_path).read_bytes() == (
         b"shared content"
     )
 
 
 def test_original_cleanup_failure_does_not_restore_deleted_content(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    store: Store, monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     document_id = _upload(store)
     original = store.list_documents()[0]
-    original_path = tmp_path / original.relative_path
+    original_path = store.data_dir / original.relative_path
     original_unlink = Path.unlink
 
     def denied_unlink(path: Path, missing_ok: bool = False) -> None:
@@ -608,10 +579,8 @@ def test_original_cleanup_failure_does_not_restore_deleted_content(
 
 
 def test_delete_preserves_identical_uploads_and_drive_originals(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     deleted_id = _upload(store)
     _upload(store, "20:25", 200)
     _upload(store, "10:26")
@@ -624,7 +593,7 @@ def test_delete_preserves_identical_uploads_and_drive_originals(
 
     assert store.list_documents()[1:] == originals
     assert all(
-        (tmp_path / doc.relative_path).read_bytes() == b"shared content"
+        (store.data_dir / doc.relative_path).read_bytes() == b"shared content"
         for doc in originals
     )
 
@@ -703,10 +672,8 @@ def test_initialize_migrates_the_telegram_upload_schema(
 
 
 def test_active_document_check_accepts_empty_and_duplicate_identifiers(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     uploaded = _upload(store)
     drive = store.upsert_drive_document(
         "drive-1", "drive.txt", b"drive", "Drive advice", None,
@@ -718,10 +685,8 @@ def test_active_document_check_accepts_empty_and_duplicate_identifiers(
 
 
 def test_active_document_check_rejects_inactive_and_deleted_sources(
-    tmp_path: Path,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     active = _upload(store)
     inactive = _upload(store, "10:26")
     deleted = _upload(store, "10:27")

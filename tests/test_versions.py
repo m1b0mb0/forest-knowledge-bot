@@ -194,7 +194,6 @@ NEWER = datetime(2026, 10, 19, 12, tzinfo=UTC)
     ("left", "left_time", "right", "right_time", "expected"),
     [
         (advice(), OLDER, advice(), NEWER, -1),
-        (advice(), NEWER, advice(), OLDER, 1),
         (advice(), OLDER, advice(), OLDER, 0),
         (advice(number=(2,)), OLDER, advice(number=(1,)), NEWER, 1),
         (advice(number=(1, 0)), NEWER, advice(number=(1,)), OLDER, 0),

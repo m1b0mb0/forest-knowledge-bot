@@ -109,8 +109,3 @@ Alternatively, run tests in the built Docker image:
 ```sh
 docker compose run --rm --no-deps -T --volume "./tests:/app/tests:ro" bot python -m pytest -q -p no:cacheprovider --basetemp=/tmp/forest-archive-tests /app/tests
 ```
-
-To enable optional Groq checks on fictional documents, add
-`-e RUN_GROQ_LIVE=1` after `run` and target `/app/tests/test_llm_live.py`.
-These checks spend API tokens; run only selected cases with `-k` and stop on
-the first failure with `-x`.

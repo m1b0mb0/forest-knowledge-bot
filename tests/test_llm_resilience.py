@@ -4,7 +4,6 @@ import asyncio
 import json
 import traceback
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -15,21 +14,14 @@ import pytest
 
 from bot.services import llm
 from bot.storage import Document
+from tests.helpers import completion as response
+from tests.helpers import make_client, make_document
+
+pytestmark = pytest.mark.usefixtures("offline_token_counts")
 
 
 def document(text: str = "Внесок — 17 каштанів.") -> Document:
-    return Document(
-        id=42,
-        source="drive",
-        source_id="fictitious-source",
-        name="Умови внеску.txt",
-        relative_path=Path("documents/42.txt"),
-        text=text,
-        modified_at="2026-10-18T12:00:00Z",
-        created_at="2026-10-18T12:00:00Z",
-        imported_at="2026-10-18T12:00:00Z",
-        active=True,
-    )
+    return make_document(text=text)
 
 
 def selected(*ids: int) -> dict[str, Any]:
@@ -48,23 +40,9 @@ def answered(
     }
 
 
-def response(value: Any) -> SimpleNamespace:
-    content = value if isinstance(value, str) else json.dumps(value)
-    return SimpleNamespace(
-        choices=[SimpleNamespace(
-            message=SimpleNamespace(content=content), finish_reason="stop",
-        )],
-        usage=SimpleNamespace(prompt_tokens=100, completion_tokens=30),
-    )
-
-
 def assistant(*values: Any) -> tuple[llm.ArchiveAssistant, AsyncMock]:
     create = AsyncMock(side_effect=list(values))
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
-    )
-    service = llm.ArchiveAssistant(client, "test-model")
-    return service, create
+    return llm.ArchiveAssistant(make_client(create), "test-model"), create
 
 
 def rate_limit(
@@ -89,11 +67,6 @@ def rate_limit(
         response=httpx.Response(429, headers=headers, request=request),
         body=body,
     )
-
-
-@pytest.fixture(autouse=True)
-def offline_token_counts(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(llm, "_count_tokens", lambda text: len(text.split()))
 
 
 @pytest.fixture

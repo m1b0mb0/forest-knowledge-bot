@@ -1,12 +1,10 @@
 """Version changes exclude stale answers without contacting external APIs."""
 
 import asyncio
-import json
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram.types import Message
@@ -14,6 +12,9 @@ from aiogram.types import Message
 from bot.handlers import text_handler
 from bot.services import llm
 from bot.storage import Store
+from tests.helpers import completion, make_client
+
+pytestmark = pytest.mark.usefixtures("offline_token_counts", "typing")
 
 OAK_NAME = "Членські внески рукавички Під дубом.txt"
 PINE_NAME = "Членські внески рукавички У соснах.txt"
@@ -24,25 +25,6 @@ QUESTION = "Який внесок у рукавичці Під дубом?"
 ARCHIVE_CHANGED = (
     "Архів змінився під час підготовки відповіді. Повтори запитання."
 )
-
-
-@pytest.fixture(autouse=True)
-def offline_services(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Avoid tokenizer downloads and Telegram typing requests."""
-    monkeypatch.setattr(llm, "_count_tokens", lambda value: len(value.split()))
-    context = MagicMock()
-    context.__aenter__ = AsyncMock()
-    context.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(
-        "bot.handlers.ChatActionSender.typing", Mock(return_value=context)
-    )
-
-
-@pytest.fixture
-def store(tmp_path: Path) -> Store:
-    instance = Store(tmp_path)
-    instance.initialize()
-    return instance
 
 
 def add_old_advice(store: Store) -> int:
@@ -63,16 +45,6 @@ def add_new_advice(store: Store, name: str = OAK_NAME) -> int:
     )
 
 
-def completion(payload: dict[str, object]) -> SimpleNamespace:
-    return SimpleNamespace(
-        choices=[SimpleNamespace(
-            finish_reason="stop",
-            message=SimpleNamespace(content=json.dumps(payload)),
-        )],
-        usage=None,
-    )
-
-
 def selection(document_id: int) -> SimpleNamespace:
     return completion({
         "status": "selected", "document_ids": [document_id], "text": "",
@@ -87,10 +59,7 @@ def answer(fact: str) -> SimpleNamespace:
 
 
 def assistant(create: AsyncMock) -> llm.ArchiveAssistant:
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
-    )
-    return llm.ArchiveAssistant(client, "offline-test-model")
+    return llm.ArchiveAssistant(make_client(create), "offline-test-model")
 
 
 def test_new_advice_replaces_cached_answer_and_excludes_previous_source(

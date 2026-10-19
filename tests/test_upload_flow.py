@@ -4,10 +4,9 @@ import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from typing import BinaryIO, cast
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.types import Document as TelegramDocument
@@ -17,26 +16,20 @@ from bot.handlers import document_handler, text_handler
 from bot.services import llm
 from bot.services.uploads import UploadService
 from bot.storage import Store
+from tests.helpers import completion, make_client
+
+pytestmark = pytest.mark.usefixtures("offline_token_counts", "typing")
 
 
 def test_uploaded_text_is_shared_persistent_and_cited_with_real_metadata(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    store: Store,
 ) -> None:
-    store = Store(tmp_path)
-    store.initialize()
     store.upsert_drive_document(
         "unrelated", "Догляд за садом.txt", b"garden", "Поливати сад.", None
     )
     text = "Майстерня відкрита щовівторка о 17:30."
     content = text.encode("utf-8")
     filename = "Розклад майстерні рукавички Біля клена.txt"
-    context = MagicMock()
-    context.__aenter__ = AsyncMock()
-    context.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(
-        "bot.handlers.ChatActionSender.typing", Mock(return_value=context)
-    )
-    monkeypatch.setattr(llm, "_count_tokens", lambda value: len(value.split()))
 
     async def download(
         file_path: str, *, destination: BinaryIO, **kwargs: object,
@@ -76,31 +69,20 @@ def test_uploaded_text_is_shared_persistent_and_cited_with_real_metadata(
         answer=AsyncMock(),
     ))
     create = AsyncMock()
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
-    )
-
-    def completion(payload: dict[str, object]) -> SimpleNamespace:
-        return SimpleNamespace(
-            choices=[SimpleNamespace(
-                finish_reason="stop",
-                message=SimpleNamespace(content=json.dumps(payload)),
-            )],
-            usage=None,
-        )
+    client = make_client(create)
 
     async def scenario() -> None:
         with ThreadPoolExecutor(max_workers=1) as executor:
             uploads = UploadService(store, executor)
             await document_handler(uploader, uploads, {})
-        reopened = Store(tmp_path)
+        reopened = Store(store.data_dir)
         uploaded = next(
             item for item in reopened.list_documents()
             if item.source == "telegram"
         )
         assert uploaded.owner_id == 1001
         assert uploaded.uploaded_at == sent_at.isoformat()
-        assert (tmp_path / uploaded.relative_path).read_bytes() == content
+        assert (store.data_dir / uploaded.relative_path).read_bytes() == content
         create.side_effect = [
             completion({
                 "status": "selected", "document_ids": [uploaded.id],

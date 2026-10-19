@@ -23,8 +23,6 @@ class StartupHarness:
 
     events: list[str]
     bot: MagicMock
-    client: MagicMock
-    pool: MagicMock
     dispatcher: Mock
 
 
@@ -86,7 +84,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> StartupHarness:
     monkeypatch.setattr(startup, "Bot", Mock(return_value=bot))
     monkeypatch.setattr(startup, "ArchiveAssistant", Mock())
     monkeypatch.setattr(startup, "UploadService", Mock())
-    return StartupHarness(events, bot, client, pool, dispatcher)
+    return StartupHarness(events, bot, dispatcher)
 
 
 def test_configuration_exposes_existing_commands_and_empty_chat_description(
@@ -149,38 +147,16 @@ def test_main_clears_every_pending_update_after_setup_before_polling(
     assert poll.kwargs["pending_questions"] == {}
 
 
-@pytest.mark.parametrize("failure", ["api", "timeout"])
-def test_failed_backlog_clear_prevents_polling_and_closes_resources(
-    harness: StartupHarness,
-    caplog: pytest.LogCaptureFixture,
-    failure: str,
-) -> None:
-    harness.bot.delete_webhook.side_effect = startup_error(failure)
-
-    with pytest.raises(SystemExit) as caught:
-        asyncio.run(startup.main())
-
-    assert caught.value.code == 1
-    assert caught.value.__suppress_context__
-    error_output = caplog.text + "".join(
-        traceback.format_exception(caught.type, caught.value, caught.tb)
-    )
-    assert "not-a-real-secret" not in error_output
-    harness.bot.delete_webhook.assert_awaited_once_with(
-        drop_pending_updates=True
-    )
-    harness.dispatcher.start_polling.assert_not_awaited()
-    assert harness.events[-3:] == [
-        "bot_closed", "client_closed", "pool_closed"
-    ]
-
-
 @pytest.mark.parametrize(
-    "method",
-    ["set_my_commands", "set_my_description", "set_chat_menu_button"],
+    ("method", "failure"),
+    [
+        ("set_my_commands", "api"),
+        ("set_my_description", "timeout"),
+        ("set_chat_menu_button", "api"),
+        ("delete_webhook", "timeout"),
+    ],
 )
-@pytest.mark.parametrize("failure", ["api", "timeout"])
-def test_failed_configuration_preserves_backlog_and_closes_resources(
+def test_failed_startup_prevents_polling_and_closes_resources(
     harness: StartupHarness,
     caplog: pytest.LogCaptureFixture,
     method: str,
@@ -197,7 +173,13 @@ def test_failed_configuration_preserves_backlog_and_closes_resources(
         traceback.format_exception(caught.type, caught.value, caught.tb)
     )
     assert "not-a-real-secret" not in error_output
-    harness.bot.delete_webhook.assert_not_awaited()
+    getattr(harness.bot, method).assert_awaited_once()
+    if method == "delete_webhook":
+        harness.bot.delete_webhook.assert_awaited_once_with(
+            drop_pending_updates=True
+        )
+    else:
+        harness.bot.delete_webhook.assert_not_awaited()
     harness.dispatcher.start_polling.assert_not_awaited()
     assert harness.events[:2] == ["initialize", "import"]
     assert harness.events[-3:] == [

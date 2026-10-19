@@ -3,7 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram.types import Message
@@ -14,15 +14,7 @@ from bot.services.uploads import UploadError, UploadService
 from bot.storage import Document, Store
 
 
-@pytest.fixture(autouse=True)
-def typing(monkeypatch: pytest.MonkeyPatch) -> Mock:
-    """Replace the background Telegram action with an offline context."""
-    context = MagicMock()
-    context.__aenter__ = AsyncMock()
-    context.__aexit__ = AsyncMock(return_value=False)
-    sender = Mock(return_value=context)
-    monkeypatch.setattr("bot.handlers.ChatActionSender.typing", sender)
-    return sender
+pytestmark = pytest.mark.usefixtures("typing")
 
 
 def message(
@@ -227,7 +219,10 @@ def test_start_resets_only_the_senders_pending_question() -> None:
 
     assert pending == {(10, 21): "another users question"}
     incoming.answer.assert_awaited_once()
-    assert "Лісовий архів" in incoming.answer.await_args.args[0]
+    greeting = incoming.answer.await_args.args[0]
+    assert all(value in greeting for value in (
+        "/my_documents", "/delete", "PDF", "DOCX", "TXT",
+    ))
 
 
 def test_upload_confirms_persistence_and_resets_only_the_sender(

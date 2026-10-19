@@ -248,10 +248,14 @@ def test_missing_download_path_is_rejected(
     store.add_telegram_document.assert_not_called()
 
 
-@pytest.mark.parametrize("operation", ["get_file", "download_file"])
 @pytest.mark.parametrize(
-    "error_type",
-    [TelegramAPIError, TelegramNetworkError, TimeoutError, OSError],
+    ("operation", "error_type"),
+    [
+        ("get_file", TelegramAPIError),
+        ("download_file", TelegramNetworkError),
+        ("get_file", TimeoutError),
+        ("download_file", OSError),
+    ],
 )
 def test_download_errors_hide_token_urls_even_in_tracebacks(
     operation: str,

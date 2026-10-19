@@ -12,13 +12,6 @@ OAK = "Членські внески рукавички Під дубом.txt"
 PINE = "Членські внески рукавички У соснах.txt"
 
 
-@pytest.fixture
-def store(tmp_path: Path) -> Store:
-    instance = Store(tmp_path)
-    instance.initialize()
-    return instance
-
-
 def upload(
     store: Store, source_id: str, day: int, *,
     metadata: str = "", name: str = OAK,

@@ -165,13 +165,7 @@ class Store:
                     else:
                         reactivate = False
 
-                    destination_exists = destination.exists()
-                    if (
-                        not destination_exists
-                        or destination.stat().st_size != len(content)
-                    ):
-                        self._write_file(destination, content)
-                        created_file = not destination_exists
+                    created_file = self._ensure_original(destination, content)
 
                     connection.execute(
                         """
@@ -266,13 +260,7 @@ class Store:
                     if previous is not None:
                         return int(previous["id"])
 
-                    destination_exists = destination.exists()
-                    if (
-                        not destination_exists
-                        or destination.stat().st_size != len(content)
-                    ):
-                        self._write_file(destination, content)
-                        created_file = not destination_exists
+                    created_file = self._ensure_original(destination, content)
 
                     cursor = connection.execute(
                         """
@@ -519,19 +507,17 @@ class Store:
                 identifier = groups[identifier]
             return identifier
 
-        for position, left in enumerate(rows):
-            left_version = cls._version(left)
-            left_timestamp = cls._timestamp(left)
-            if left_version is None or left_timestamp is None:
-                continue
-            for right in rows[position + 1:]:
-                right_version = cls._version(right)
-                right_timestamp = cls._timestamp(right)
-                if right_version is None or right_timestamp is None:
-                    continue
+        profiles = []
+        for row in rows:
+            profile = cls._version(row)
+            timestamp = cls._timestamp(row)
+            if profile is not None and timestamp is not None:
+                profiles.append((row, profile, timestamp))
+
+        for position, (left, left_version, left_time) in enumerate(profiles):
+            for right, right_version, right_time in profiles[position + 1:]:
                 comparison = compare_versions(
-                    left_version, left_timestamp,
-                    right_version, right_timestamp,
+                    left_version, left_time, right_version, right_time,
                 )
                 if comparison == -1:
                     newer[left["id"]].add(right["id"])
@@ -625,6 +611,13 @@ class Store:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def _ensure_original(self, destination: Path, content: bytes) -> bool:
+        """Write or repair an original; report whether it was newly created."""
+        existed = destination.exists()
+        if not existed or destination.stat().st_size != len(content):
+            self._write_file(destination, content)
+        return not existed
 
     @staticmethod
     def _write_file(destination: Path, content: bytes) -> None:
