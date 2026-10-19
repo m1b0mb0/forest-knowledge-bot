@@ -28,7 +28,7 @@ MAX_SELECTED_DOCUMENTS = 3
 MAX_EVIDENCE_QUOTES = 6
 MAX_REPLY_REPAIRS = 1
 MAX_RATE_WAIT = 5
-CACHE_SECONDS = 300
+CACHE_SECONDS = 1800
 CACHE_SIZE = 64
 NOT_FOUND = "Не знайшов відповіді в доступних документах."
 NARROW_QUESTION = (
@@ -191,6 +191,9 @@ class ArchiveAssistant:
         self._cache: OrderedDict[str, tuple[float, AssistantReply]] = (
             OrderedDict()
         )
+        self._selections: OrderedDict[str, tuple[float, tuple[int, ...]]] = (
+            OrderedDict()
+        )
         self._cache_revision: tuple[
             tuple[int, str, str, str, int | None, str | None, str | None], ...
         ] = ()
@@ -221,6 +224,7 @@ class ArchiveAssistant:
             )
             if revision != self._cache_revision:
                 self._cache.clear()
+                self._selections.clear()
                 self._cache_revision = revision
             key = " ".join(question.casefold().split())
             cached = self._cache.get(key)
@@ -228,7 +232,13 @@ class ArchiveAssistant:
                 self._cache.move_to_end(key)
                 return cached[1]
             self._retry_remaining = 1
-            reply = await self._answer(question, available)
+            try:
+                reply = await self._answer(question, available, key)
+            except InvalidReply:
+                # A malformed answer should be allowed to reroute next time.
+                self._selections.pop(key, None)
+                raise
+            self._selections.pop(key, None)
             if not reply.needs_clarification and reply.text != NOT_FOUND:
                 self._cache[key] = (time.monotonic(), reply)
                 self._cache.move_to_end(key)
@@ -237,28 +247,38 @@ class ArchiveAssistant:
             return reply
 
     async def _answer(
-        self, question: str, available: dict[int, Document]
+        self, question: str, available: dict[int, Document], key: str,
     ) -> AssistantReply:
-        catalog = "\n".join(
-            f"{' '.join(document.name.split())} [D{identifier}]"
-            for identifier, document in available.items()
-        )
-        messages = [
-            {"role": "system", "content": _SELECT_PROMPT},
-            {"role": "user", "content": f"Каталог джерел:\n{catalog}"},
-            {"role": "user", "content": question},
-        ]
-        schema = _response_schema(list(available), selection=True)
-        selection_cost = (
-            _request_tokens(messages, schema) + SELECTION_OUTPUT_TOKENS
-        )
-        if selection_cost + ANSWER_OUTPUT_TOKENS > TOKEN_BUDGET:
-            return AssistantReply(NARROW_QUESTION, needs_clarification=True)
-
-        selection = await self._phase(
-            messages, schema, list(available), SELECTION_OUTPUT_TOKENS,
-            selection=True,
-        )
+        cached = self._selections.get(key)
+        if cached and time.monotonic() - cached[0] < CACHE_SECONDS:
+            selection = {
+                "status": "selected", "document_ids": list(cached[1]),
+                "text": "",
+            }
+            selection_cost = 0
+            self._selections.move_to_end(key)
+        else:
+            catalog = "\n".join(
+                f"{' '.join(document.name.split())} [D{identifier}]"
+                for identifier, document in available.items()
+            )
+            messages = [
+                {"role": "system", "content": _SELECT_PROMPT},
+                {"role": "user", "content": f"Каталог джерел:\n{catalog}"},
+                {"role": "user", "content": question},
+            ]
+            schema = _response_schema(list(available), selection=True)
+            selection_cost = (
+                _request_tokens(messages, schema) + SELECTION_OUTPUT_TOKENS
+            )
+            if selection_cost + ANSWER_OUTPUT_TOKENS > TOKEN_BUDGET:
+                return AssistantReply(
+                    NARROW_QUESTION, needs_clarification=True,
+                )
+            selection = await self._phase(
+                messages, schema, list(available), SELECTION_OUTPUT_TOKENS,
+                selection=True,
+            )
         # Month questions must read the general calendar before giving up.
         calendars = [
             item for item in available.values()
@@ -307,6 +327,14 @@ class ArchiveAssistant:
         )
         if total_cost > TOKEN_BUDGET:
             return AssistantReply(NARROW_QUESTION, needs_clarification=True)
+
+        if not cached or time.monotonic() - cached[0] >= CACHE_SECONDS:
+            self._selections[key] = (
+                time.monotonic(), tuple(item.id for item in selected),
+            )
+            self._selections.move_to_end(key)
+            if len(self._selections) > CACHE_SIZE:
+                self._selections.popitem(last=False)
 
         result = await self._phase(
             messages, schema, identifiers, ANSWER_OUTPUT_TOKENS,
@@ -410,7 +438,7 @@ class ArchiveAssistant:
                             "schema": schema,
                         },
                     },
-                    reasoning_effort="medium",
+                    reasoning_effort="low" if selection else "medium",
                     temperature=0,
                     max_completion_tokens=max_tokens,
                 )
@@ -439,8 +467,19 @@ class ArchiveAssistant:
         usage = response.usage
         if usage is not None:
             logger.info(
-                "Groq usage: prompt=%s completion=%s tokens",
-                usage.prompt_tokens, usage.completion_tokens,
+                "Groq usage: phase=%s prompt=%s cached=%s "
+                "completion=%s reasoning=%s tokens",
+                "selection" if selection else "answer",
+                usage.prompt_tokens,
+                getattr(
+                    getattr(usage, "prompt_tokens_details", None),
+                    "cached_tokens", None,
+                ),
+                usage.completion_tokens,
+                getattr(
+                    getattr(usage, "completion_tokens_details", None),
+                    "reasoning_tokens", None,
+                ),
             )
         if not response.choices or response.choices[0].finish_reason != "stop":
             raise InvalidReply("truncated_or_empty")

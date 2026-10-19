@@ -83,8 +83,10 @@ Keep secrets in the local `.env`, which is excluded from Git and the Docker imag
   are sent immediately. One automatic retry is allowed per question; a real
   rate limit is retried only when Groq requests a wait of at most five seconds.
   Longer limits report the remaining wait instead of keeping the user waiting.
-  Successful answers are cached for five minutes and invalidated when documents
-  change. Daily quota exhaustion is reported separately.
+  Successful answers are cached for 30 minutes and invalidated when documents
+  change. Retrying the same question after a temporary answer failure reuses
+  its selected sources. Source selection uses low reasoning effort; answer
+  generation uses medium effort. Daily quota exhaustion is reported separately.
 
 ## Tests
 

@@ -99,6 +99,9 @@ def test_invalid_selection_retries_without_repeating_catalog() -> None:
     assert original[-1]["content"] in retried[-1]["content"]
     assert retried[-1]["content"] != original[-1]["content"]
     assert "[S1]" in final.kwargs["messages"][1]["content"]
+    assert first.kwargs["reasoning_effort"] == "low"
+    assert repair.kwargs["reasoning_effort"] == "low"
+    assert final.kwargs["reasoning_effort"] == "medium"
 
 
 def test_invalid_quote_retries_only_answer_phase() -> None:
@@ -330,7 +333,7 @@ def test_successful_answer_is_reused_for_case_and_whitespace() -> None:
     assert create.await_count == 2
 
 
-def test_answer_cache_expires_after_five_minutes(
+def test_answer_cache_reuses_after_five_and_expires_after_thirty_minutes(
     clock: SimpleNamespace,
 ) -> None:
     service, create = assistant(
@@ -342,7 +345,115 @@ def test_answer_cache_expires_after_five_minutes(
 
     asyncio.run(service.answer("Який внесок?", [document()]))
 
+    assert create.await_count == 2
+    clock.now += 1500
+    asyncio.run(service.answer("Який внесок?", [document()]))
+
     assert create.await_count == 4
+
+
+def test_answer_rate_limit_preserves_post_calendar_selection_until_retry(
+    clock: SimpleNamespace,
+) -> None:
+    calendar = replace(
+        document("Ягоди збирають у травні та червні."),
+        name="Календар спостережень.txt",
+    )
+    service, create = assistant(
+        response({"status": "not_found", "document_ids": [], "text": ""}),
+        rate_limit("120"),
+        response(answered(text=calendar.text, quote=calendar.text)),
+    )
+    with pytest.raises(llm.AssistantError):
+        asyncio.run(service.answer(
+            "У які місяці збирають ягоди?", [calendar],
+        ))
+    assert create.await_count == 2
+
+    with pytest.raises(llm.AssistantError):
+        asyncio.run(service.answer(
+            "  У ЯКІ   МІСЯЦІ збирають ягоди?  ", [calendar],
+        ))
+    assert create.await_count == 2
+    clock.now += 121
+
+    reply = asyncio.run(service.answer(
+        "  У ЯКІ   МІСЯЦІ збирають ягоди?  ", [calendar],
+    ))
+
+    assert create.await_count == 3
+    assert reply.text == (
+        f"{calendar.text}\n\n— з документа «Календар спостережень»"
+    )
+    for call in create.await_args_list[1:]:
+        contents = call.kwargs["messages"][1]["content"]
+        assert "[S1] Календар спостережень.txt" in contents
+        assert calendar.text in contents
+
+
+def test_partial_selection_expires_after_thirty_minutes(
+    clock: SimpleNamespace,
+) -> None:
+    service, create = assistant(
+        response(selected(42)), TimeoutError("offline transient timeout"),
+        response(selected(42)), response(answered()),
+    )
+    with pytest.raises(llm.AssistantError):
+        asyncio.run(service.answer("Який внесок?", [document()]))
+    clock.now += 1801
+
+    reply = asyncio.run(service.answer("Який внесок?", [document()]))
+
+    assert "17 каштанів" in reply.text
+    assert create.await_count == 4
+    schema = create.await_args_list[2].kwargs["response_format"]["json_schema"]
+    assert "document_ids" in schema["schema"]["properties"]
+
+
+@pytest.mark.parametrize("change", ["text", "replaced-id"])
+def test_archive_revision_discards_a_partial_selection(change: str) -> None:
+    original = document()
+    updated = (
+        replace(original, text=original.text + " Додаткова умова.")
+        if change == "text" else replace(original, id=99)
+    )
+    service, create = assistant(
+        response(selected(42)), TimeoutError("offline transient timeout"),
+        response(selected(updated.id)), response(answered()),
+    )
+    with pytest.raises(llm.AssistantError):
+        asyncio.run(service.answer("Який внесок?", [original]))
+
+    reply = asyncio.run(service.answer("Який внесок?", [updated]))
+
+    assert "17 каштанів" in reply.text
+    assert create.await_count == 4
+    selector = create.await_args_list[2].kwargs["messages"][1]["content"]
+    assert f"[D{updated.id}]" in selector
+    if change == "replaced-id":
+        assert "[D42]" not in selector
+
+
+@pytest.mark.parametrize("status", ["not_found", "clarify"])
+def test_completed_non_answer_discards_partial_selection(status: str) -> None:
+    service, create = assistant(
+        response(selected(42)), TimeoutError("offline transient timeout"),
+        response({"status": status, "evidence": [], "text": "Яке місце?"}),
+        response(selected(42)), response(answered()),
+    )
+    with pytest.raises(llm.AssistantError):
+        asyncio.run(service.answer("Який внесок?", [document()]))
+
+    non_answer = asyncio.run(service.answer("Який внесок?", [document()]))
+    assert non_answer.needs_clarification is (status == "clarify")
+    assert create.await_count == 3
+
+    reply = asyncio.run(service.answer("Який внесок?", [document()]))
+
+    assert "17 каштанів" in reply.text
+    assert create.await_count == 5
+    schema = create.await_args_list[3].kwargs["response_format"]["json_schema"]
+    assert "document_ids" in schema["schema"]["properties"]
 
 
 @pytest.mark.parametrize("change", ["id", "name", "text", "active"])

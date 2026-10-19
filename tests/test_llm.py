@@ -114,6 +114,8 @@ def test_selection_gets_names_then_answer_gets_selected_full_texts() -> None:
     assert "Не показувати цей текст відбору." not in reply.text
     assert create.await_count == 2
     selection_call, answer_call = create.await_args_list
+    assert selection_call.kwargs["reasoning_effort"] == "low"
+    assert answer_call.kwargs["reasoning_effort"] == "medium"
     selection = json.dumps(selection_call.kwargs, ensure_ascii=False)
     answer = messages_text(answer_call)
     assert all(item.name in selection for item in documents)
