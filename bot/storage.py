@@ -27,6 +27,9 @@ class Document:
     created_at: str
     imported_at: str
     active: bool
+    owner_id: int | None = None
+    owner_name: str | None = None
+    uploaded_at: str | None = None
 
 
 class Store:
@@ -53,10 +56,28 @@ class Store:
                     created_at TEXT NOT NULL,
                     imported_at TEXT NOT NULL,
                     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                    owner_id INTEGER,
+                    owner_name TEXT,
+                    uploaded_at TEXT,
                     UNIQUE (source, source_id)
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(documents)")
+            }
+            with connection:
+                for name, column_type in (
+                    ("owner_id", "INTEGER"),
+                    ("owner_name", "TEXT"),
+                    ("uploaded_at", "TEXT"),
+                ):
+                    if name not in columns:
+                        connection.execute(
+                            f"ALTER TABLE documents ADD COLUMN "
+                            f"{name} {column_type}"
+                        )
 
     def upsert_drive_document(
         self,
@@ -142,6 +163,82 @@ class Store:
             self._remove_file(self.data_dir / previous_path)
         return document_id
 
+    def add_telegram_document(
+        self,
+        source_id: str,
+        name: str,
+        content: bytes,
+        text: str,
+        owner_id: int,
+        owner_name: str,
+        uploaded_at: datetime,
+    ) -> int:
+        """Persist an upload, keeping the first record when it is replayed.
+
+        ``source_id`` identifies the Telegram chat and message, not the file.
+        Sending identical bytes in another message creates a separate source
+        with its own owner. Existing uploads are never overwritten here.
+        """
+        if uploaded_at.utcoffset() is None:
+            raise ValueError("The upload timestamp must include a timezone.")
+        uploaded_time = uploaded_at.astimezone(timezone.utc).isoformat()
+        fingerprint = hashlib.sha256(
+            b"telegram\0" + source_id.encode("utf-8") + b"\0" + content
+        ).hexdigest()
+        relative_path = Path("documents") / f"{fingerprint}.bin"
+        destination = self.data_dir / relative_path
+        now = datetime.now(timezone.utc).isoformat()
+        created_file = False
+
+        with closing(self._connect()) as connection:
+            try:
+                with connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    previous = connection.execute(
+                        """
+                        SELECT id FROM documents
+                        WHERE source = 'telegram' AND source_id = ?
+                        """,
+                        (source_id,),
+                    ).fetchone()
+                    if previous is not None:
+                        return int(previous["id"])
+
+                    destination_exists = destination.exists()
+                    if (
+                        not destination_exists
+                        or destination.stat().st_size != len(content)
+                    ):
+                        self._write_file(destination, content)
+                        created_file = not destination_exists
+
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO documents (
+                            source, source_id, name, relative_path, text,
+                            created_at, imported_at,
+                            owner_id, owner_name, uploaded_at
+                        ) VALUES ('telegram', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            source_id,
+                            name,
+                            relative_path.as_posix(),
+                            text,
+                            now,
+                            now,
+                            owner_id,
+                            owner_name,
+                            uploaded_time,
+                        ),
+                    )
+                    document_id = int(cursor.lastrowid)
+            except Exception:
+                if created_file:
+                    self._remove_file(destination)
+                raise
+        return document_id
+
     def list_documents(self) -> list[Document]:
         """Return stored documents in insertion order."""
         with closing(self._connect()) as connection:
@@ -160,6 +257,9 @@ class Store:
                 created_at=row["created_at"],
                 imported_at=row["imported_at"],
                 active=bool(row["active"]),
+                owner_id=row["owner_id"],
+                owner_name=row["owner_name"],
+                uploaded_at=row["uploaded_at"],
             )
             for row in rows
         ]

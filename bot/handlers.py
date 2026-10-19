@@ -8,6 +8,7 @@ from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
 from bot.services.llm import ArchiveAssistant, AssistantError
+from bot.services.uploads import UploadError, UploadService
 from bot.storage import Store
 
 router = Router(name=__name__)
@@ -23,7 +24,33 @@ async def start_handler(
     await message.answer(
         "Вітаю! Я — «Лісовий архів».\n"
         "Став запитання про документи архіву. "
-        "Якщо запитання стосується певного місця, зазнач його назву."
+        "Якщо запитання стосується певного місця, зазнач його назву.\n"
+        "Також можна надіслати PDF, DOCX або TXT, "
+        "щоб додати файл до спільного архіву."
+    )
+
+
+@router.message(F.document)
+async def document_handler(
+    message: Message,
+    uploads: UploadService,
+    pending_questions: dict[tuple[int, int], str],
+) -> None:
+    """Confirm an upload only after its text and original are persisted."""
+    try:
+        async with ChatActionSender.typing(
+            bot=message.bot, chat_id=message.chat.id,
+        ):
+            await uploads.import_document(message)
+    except UploadError as error:
+        await message.answer(str(error))
+        return
+
+    if message.from_user is not None:
+        pending_questions.pop((message.chat.id, message.from_user.id), None)
+    await message.answer(
+        "Файл додано до спільного архіву. "
+        "Тепер можна ставити запитання за його вмістом."
     )
 
 

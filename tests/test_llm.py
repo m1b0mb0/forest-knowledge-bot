@@ -566,6 +566,144 @@ def test_multiple_sources_use_plural_label_and_each_actual_title() -> None:
     assert create.await_count == 2
 
 
+@pytest.mark.parametrize("uploaded_at", [
+    "2026-09-23T14:05:00Z", "2026-09-23T16:05:00+02:00",
+])
+def test_telegram_source_uses_stored_author_and_utc_upload_time(
+    uploaded_at: str,
+) -> None:
+    source = replace(
+        document(42, "Розклад зустрічей.txt", "Зустрічі щочетверга."),
+        source="telegram", owner_id=987654321,
+        owner_name="  Тестова\n  Білка  ", uploaded_at=uploaded_at,
+    )
+    service, create = assistant(
+        response(selection_payload(source)),
+        response(payload(
+            evidence=[citation(1, source.text)], text=source.text,
+        )),
+    )
+
+    reply = asyncio.run(service.answer("Коли зустрічі?", [source]))
+
+    assert reply.text == (
+        "Зустрічі щочетверга.\n\n— з документа «Розклад зустрічей» "
+        "(від Тестова Білка; надіслано 23.09.2026 14:05 UTC)"
+    )
+    requests = json.dumps([
+        call.kwargs for call in create.await_args_list
+    ], ensure_ascii=False)
+    assert "Тестова" not in requests
+    assert str(source.owner_id) not in requests
+    assert uploaded_at not in requests
+    assert "owner_name" not in requests
+    assert "uploaded_at" not in requests
+
+
+def test_only_cited_telegram_source_contributes_its_provenance() -> None:
+    first = replace(
+        document(1, "Старий розклад.txt", "Зустрічі щосереди."),
+        source="telegram", owner_id=111, owner_name="Інша Тестова Білка",
+        uploaded_at="2026-09-22T09:30:00Z",
+    )
+    second = replace(
+        document(42, "Новий розклад.txt", "Зустрічі щочетверга."),
+        source="telegram", owner_id=222, owner_name="Тестова Сова",
+        uploaded_at="2026-09-23T14:05:00Z",
+    )
+    service, create = assistant(
+        response(selection_payload(first, second)),
+        response(payload(
+            evidence=[citation(2, second.text)], text=second.text,
+        )),
+    )
+
+    reply = asyncio.run(service.answer("Коли зустрічі?", [first, second]))
+
+    assert reply.text == (
+        "Зустрічі щочетверга.\n\n— з документа «Новий розклад» "
+        "(від Тестова Сова; надіслано 23.09.2026 14:05 UTC)"
+    )
+    assert first.owner_name not in reply.text
+    assert "22.09.2026" not in reply.text
+    assert create.await_count == 2
+
+
+def test_mixed_sources_keep_drive_title_and_add_telegram_provenance() -> None:
+    drive = document(1, "Умови зборів.pdf", "Внесок — 275 грн.")
+    telegram = replace(
+        document(42, "Розклад зборів.txt", "Збори у вівторок."),
+        source="telegram", owner_id=222, owner_name="@fictitious_owl",
+        uploaded_at="2026-09-23T14:05:00Z",
+    )
+    service, create = assistant(
+        response(selection_payload(drive, telegram)),
+        response(payload(
+            evidence=[citation(1, drive.text), citation(2, telegram.text)],
+            text="Внесок — 275 грн, збори у вівторок.",
+        )),
+    )
+
+    reply = asyncio.run(service.answer("Які умови зборів?", [drive, telegram]))
+
+    assert reply.text == (
+        "Внесок — 275 грн, збори у вівторок.\n\n— з документів "
+        "«Умови зборів», «Розклад зборів» "
+        "(від @fictitious_owl; надіслано 23.09.2026 14:05 UTC)"
+    )
+    assert create.await_count == 2
+
+
+@pytest.mark.parametrize("changes", [
+    {"owner_id": None}, {"owner_id": 0}, {"owner_id": True},
+    {"owner_name": None}, {"owner_name": " \n\t"},
+    {"uploaded_at": None}, {"uploaded_at": "not-a-date"},
+    {"uploaded_at": "2026-09-23T14:05:00"},
+])
+def test_cited_telegram_source_requires_complete_provenance(
+    changes: dict[str, Any],
+) -> None:
+    source = replace(
+        document(42, "Розклад.txt", "Зустрічі щочетверга."),
+        source="telegram", owner_id=222, owner_name="Тестова Сова",
+        uploaded_at="2026-09-23T14:05:00Z",
+    )
+    source = replace(source, **changes)
+    service, create = assistant(
+        response(selection_payload(source)),
+        response(payload(
+            evidence=[citation(1, source.text)], text=source.text,
+        )),
+    )
+
+    with pytest.raises(llm.AssistantError) as caught:
+        asyncio.run(service.answer("Коли зустрічі?", [source]))
+
+    assert "автора або час" in str(caught.value)
+    assert "Тестова Сова" not in str(caught.value)
+    assert "not-a-date" not in str(caught.value)
+    assert create.await_count == 2
+
+
+def test_uncited_telegram_document_does_not_require_its_provenance() -> None:
+    drive = document(1, "Правила.txt", "Не ламати дерева.")
+    telegram = replace(
+        document(42, "Розклад.txt", "Зустрічі щочетверга."),
+        source="telegram",
+    )
+    service, create = assistant(
+        response(selection_payload(drive, telegram)),
+        response(payload(
+            evidence=[citation(1, drive.text)], text=drive.text,
+        )),
+    )
+
+    reply = asyncio.run(service.answer("Які правила?", [drive, telegram]))
+
+    assert reply.text == "Не ламати дерева.\n\n— з документа «Правила»"
+    assert create.await_count == 2
+
+
 @pytest.mark.parametrize("status,text,clarification", [
     ("not_found", "Неіснуюча довідка.pdf", False),
     ("clarify", "Уточни, будь ласка, рік внеску.", True),

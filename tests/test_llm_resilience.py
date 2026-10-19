@@ -396,6 +396,60 @@ def test_archive_change_invalidates_cached_answers(change: str) -> None:
     assert create.await_count == 4
 
 
+@pytest.mark.parametrize("change,value", [
+    ("source", "drive"),
+    ("owner_id", 333),
+    ("owner_name", "Інша Тестова Сова"),
+    ("uploaded_at", "2026-09-24T15:10:00Z"),
+])
+def test_provenance_change_invalidates_a_cached_answer(
+    change: str, value: str | int,
+) -> None:
+    original = replace(
+        document(), source="telegram", owner_id=222,
+        owner_name="Тестова Білка", uploaded_at="2026-09-23T14:05:00Z",
+    )
+    updated = replace(original, **{change: value})
+    service, create = assistant(
+        response(selected(42)), response(answered()),
+        response(selected(42)), response(answered()),
+    )
+    first = asyncio.run(service.answer("Який внесок?", [original]))
+
+    second = asyncio.run(service.answer("Який внесок?", [updated]))
+
+    assert create.await_count == 4
+    assert "Тестова Білка" in first.text
+    if change == "owner_name":
+        assert "Інша Тестова Сова" in second.text
+        assert "Тестова Білка" not in second.text
+    elif change == "uploaded_at":
+        assert "24.09.2026 15:10 UTC" in second.text
+        assert "23.09.2026 14:05 UTC" not in second.text
+    elif change == "source":
+        assert second.text.endswith("— з документа «Умови внеску»")
+        assert "Тестова Білка" not in second.text
+
+
+def test_missing_provenance_cannot_reuse_a_previously_cached_answer() -> None:
+    original = replace(
+        document(), source="telegram", owner_id=222,
+        owner_name="Тестова Білка", uploaded_at="2026-09-23T14:05:00Z",
+    )
+    service, create = assistant(
+        response(selected(42)), response(answered()),
+        response(selected(42)), response(answered()),
+    )
+    asyncio.run(service.answer("Який внесок?", [original]))
+
+    with pytest.raises(llm.AssistantError):
+        asyncio.run(service.answer(
+            "Який внесок?", [replace(original, owner_name=None)],
+        ))
+
+    assert create.await_count == 4
+
+
 @pytest.mark.parametrize("status", ["clarify", "not_found"])
 def test_non_answers_are_not_cached(status: str) -> None:
     value = {"status": status, "document_ids": [], "text": "Яке місце?"}

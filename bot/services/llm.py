@@ -10,6 +10,7 @@ import unicodedata
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
 
@@ -189,7 +190,9 @@ class ArchiveAssistant:
         self._cache: OrderedDict[str, tuple[float, AssistantReply]] = (
             OrderedDict()
         )
-        self._cache_revision: tuple[tuple[int, str, str], ...] = ()
+        self._cache_revision: tuple[
+            tuple[int, str, str, str, int | None, str | None, str | None], ...
+        ] = ()
 
     async def answer(
         self, question: str, documents: Sequence[Document]
@@ -208,7 +211,11 @@ class ArchiveAssistant:
         # Keep each question's selection and answer together across users.
         async with self._lock:
             revision = tuple(
-                (item.id, item.name, item.text) for item in available.values()
+                (
+                    item.id, item.name, item.text, item.source, item.owner_id,
+                    item.owner_name, item.uploaded_at,
+                )
+                for item in available.values()
             )
             if revision != self._cache_revision:
                 self._cache.clear()
@@ -312,7 +319,8 @@ class ArchiveAssistant:
             document = sources_by_id[identifier]
             cited_sources[identifier] = document
         sources = ", ".join(
-            _source_title(document.name) for document in cited_sources.values()
+            _source_description(document)
+            for document in cited_sources.values()
         )
         source_label = (
             "з документа" if len(cited_sources) == 1 else "з документів"
@@ -581,6 +589,36 @@ def _compact_text(text: str) -> str:
         re.sub(r"[^\S\n]+", " ", line).strip() for line in text.splitlines()
     ]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _source_description(document: Document) -> str:
+    """Use stored provenance locally; never trust model-supplied authors."""
+    title = _source_title(document.name)
+    if document.source != "telegram":
+        return title
+    if (
+        type(document.owner_id) is not int or document.owner_id <= 0
+        or not isinstance(document.owner_name, str)
+        or not document.owner_name.strip()
+        or not isinstance(document.uploaded_at, str)
+        or not document.uploaded_at
+    ):
+        raise AssistantError(
+            "Не вдалося визначити автора або час завантаження документа."
+        )
+    try:
+        uploaded_at = datetime.fromisoformat(document.uploaded_at)
+        if uploaded_at.utcoffset() is None:
+            raise ValueError("A timezone is required")
+    except ValueError:
+        raise AssistantError(
+            "Не вдалося визначити автора або час завантаження документа."
+        ) from None
+    uploaded_at = uploaded_at.astimezone(UTC)
+    return (
+        f"{title} (від {' '.join(document.owner_name.split())}; "
+        f"надіслано {uploaded_at:%d.%m.%Y %H:%M} UTC)"
+    )
 
 
 def _source_title(name: str) -> str:

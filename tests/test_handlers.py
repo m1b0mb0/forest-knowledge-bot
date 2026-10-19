@@ -8,8 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 from aiogram.types import Message
 
-from bot.handlers import start_handler, text_handler
+from bot.handlers import document_handler, start_handler, text_handler
 from bot.services.llm import ArchiveAssistant, AssistantError, AssistantReply
+from bot.services.uploads import UploadError, UploadService
 from bot.storage import Document, Store
 
 
@@ -227,3 +228,36 @@ def test_start_resets_only_the_senders_pending_question() -> None:
     assert pending == {(10, 21): "another users question"}
     incoming.answer.assert_awaited_once()
     assert "Лісовий архів" in incoming.answer.await_args.args[0]
+
+
+def test_upload_confirms_persistence_and_resets_only_the_sender(
+    typing: Mock,
+) -> None:
+    incoming = message(None)
+    uploads = Mock(spec=UploadService)
+    uploads.import_document = AsyncMock(return_value=123)
+    pending = {(10, 20): "own question", (10, 21): "another question"}
+
+    asyncio.run(document_handler(incoming, uploads, pending))
+
+    uploads.import_document.assert_awaited_once_with(incoming)
+    assert pending == {(10, 21): "another question"}
+    assert "додано до спільного архіву" in (
+        incoming.answer.await_args.args[0]
+    )
+    typing.return_value.__aenter__.assert_awaited_once()
+    typing.return_value.__aexit__.assert_awaited_once()
+
+
+def test_upload_error_preserves_pending_question() -> None:
+    incoming = message(None)
+    uploads = Mock(spec=UploadService)
+    uploads.import_document = AsyncMock(side_effect=UploadError(
+        "Не вдалося прочитати файл."
+    ))
+    pending = {(10, 20): "Скільки внесок?"}
+
+    asyncio.run(document_handler(incoming, uploads, pending))
+
+    incoming.answer.assert_awaited_once_with("Не вдалося прочитати файл.")
+    assert pending == {(10, 20): "Скільки внесок?"}

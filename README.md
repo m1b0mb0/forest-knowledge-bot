@@ -2,7 +2,8 @@
 
 A Telegram bot that answers Ukrainian questions about a public Google Drive
 archive. Groq selects documents by filename, reads their full texts and returns
-an answer with source names. Documents persist in SQLite and a Docker volume.
+an answer with source names. Users can add documents by sending files in Telegram.
+Documents persist in SQLite and a Docker volume.
 
 ## Requirements
 
@@ -48,6 +49,9 @@ Keep secrets in the local `.env`, which is excluded from Git and the Docker imag
 - Imports PDF, DOCX and UTF-8 TXT files directly inside the configured folder.
   Google Drive access is read-only; nested folders are not imported.
 - Limits: 10 MiB per file and 100 pages per PDF.
+- Send a PDF, DOCX or UTF-8 TXT as a Telegram document to add it to the shared
+  knowledge base. Uploaded files are available to every bot user. Answers cite
+  the filename, sender and time sent (UTC).
 - PyMuPDF extracts PDF text and uses Ukrainian and English OCR data for pages
   without embedded text. OCR accuracy depends on scan quality; images on pages
   that also contain embedded text are not recognized.
