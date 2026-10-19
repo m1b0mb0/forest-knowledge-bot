@@ -6,6 +6,12 @@ from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeDefault,
+    MenuButtonCommands,
+)
 from groq import AsyncGroq
 
 from bot.config import load_archive_settings, load_bot_token, load_llm_settings
@@ -14,6 +20,31 @@ from bot.services.drive import DriveImportError, import_archive
 from bot.services.llm import ArchiveAssistant
 from bot.services.uploads import UploadService
 from bot.storage import Store
+
+
+async def configure_bot(bot: Bot) -> None:
+    """Publish the command menu and the description shown in an empty chat."""
+    await bot.set_my_commands(
+        commands=[
+            BotCommand(command="start", description="Як користуватися ботом"),
+            BotCommand(
+                command="my_documents", description="Мої завантажені документи"
+            ),
+            BotCommand(
+                command="delete", description="Видалити свій документ за ID"
+            ),
+        ],
+        scope=BotCommandScopeDefault(),
+    )
+    await bot.set_my_description(
+        description=(
+            "Допомагаю знаходити відповіді в «Лісовому архіві» \n\n"
+            "Постав запитання або надішли PDF, DOCX чи TXT, "
+            "щоб поповнити спільний архів.\n\n"
+            "Команда /start підкаже, з чого почати."
+        )
+    )
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
 async def main() -> None:
@@ -57,6 +88,17 @@ async def main() -> None:
         ):
             assistant = ArchiveAssistant(client, llm_settings.model)
             uploads = UploadService(store, parser_pool)
+            try:
+                await configure_bot(bot)
+                # Clear the backlog after imports and setup are complete.
+                # Later updates belong to the new polling run.
+                await bot.delete_webhook(drop_pending_updates=True)
+            except (TelegramAPIError, TimeoutError):
+                logging.error(
+                    "Could not prepare Telegram or clear pending updates. "
+                    "Polling was not started."
+                )
+                raise SystemExit(1) from None
             await dispatcher.start_polling(
                 bot,
                 close_bot_session=False,

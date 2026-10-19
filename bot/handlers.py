@@ -23,7 +23,7 @@ async def start_handler(
     if message.from_user is not None:
         pending_questions.pop((message.chat.id, message.from_user.id), None)
     await message.answer(
-        "Вітаю! Я — «Лісовий архів».\n"
+        "Вітаю в «Лісовому архіві»!\n"
         "Став запитання про документи архіву. "
         "Якщо запитання стосується певного місця, зазнач його назву.\n"
         "Також можна надіслати PDF, DOCX або TXT, "

@@ -36,8 +36,13 @@ Documents persist in SQLite and a Docker volume.
    ```
 
 Open the bot in Telegram and send `/start`, then ask a question in Ukrainian.
+The command menu lists `/start`, `/my_documents` and `/delete`.
 You do not need to know document titles. Include the place name for local
 rules; the bot asks for clarification if needed.
+After initialization, the bot discards pending Telegram updates before polling.
+Messages, commands and files sent while it was offline or starting are skipped;
+send them again once it is ready. Reconnects during a running session preserve
+pending updates.
 Run one instance per bot token. Press `Ctrl+C` to stop it; run
 `docker compose down` to remove the stopped container.
 Rebuild after changing code or configuration.
