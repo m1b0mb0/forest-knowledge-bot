@@ -58,8 +58,13 @@ Keep secrets in the local `.env`, which is excluded from Git and the Docker imag
 - Groq chooses up to three active documents using their filenames, so filenames
   should describe their topic and place. Full selected texts are sent to Groq;
   oversized requests require a narrower question. Sources use stored filenames.
-- [Groq rate limits](https://console.groq.com/docs/rate-limits) apply. The bot
-  reports temporary API errors; it does not retry automatically.
+  Questions asking which months also read the unique general calendar, if any.
+- [Groq rate limits](https://console.groq.com/docs/rate-limits) apply. Requests
+  are sent immediately. One automatic retry is allowed per question; a real
+  rate limit is retried only when Groq requests a wait of at most five seconds.
+  Longer limits report the remaining wait instead of keeping the user waiting.
+  Successful answers are cached for five minutes and invalidated when documents
+  change. Daily quota exhaustion is reported separately.
 
 ## Tests
 
@@ -87,4 +92,5 @@ docker compose run --rm --no-deps -T --volume "./tests:/app/tests:ro" bot python
 
 To enable optional Groq checks on fictional documents, add
 `-e RUN_GROQ_LIVE=1` after `run` and target `/app/tests/test_llm_live.py`.
-These checks send API requests and pause between cases.
+These checks spend API tokens; run only selected cases with `-k` and stop on
+the first failure with `-x`.

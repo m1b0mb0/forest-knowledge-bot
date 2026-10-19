@@ -5,6 +5,7 @@ import asyncio
 from aiogram import F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message
+from aiogram.utils.chat_action import ChatActionSender
 
 from bot.services.llm import ArchiveAssistant, AssistantError
 from bot.storage import Store
@@ -57,8 +58,13 @@ async def text_handler(
 
     documents = await asyncio.to_thread(store.list_documents)
     try:
-        reply = await assistant.answer(question, documents)
+        async with ChatActionSender.typing(
+            bot=message.bot, chat_id=message.chat.id,
+        ):
+            reply = await assistant.answer(question, documents)
     except AssistantError as error:
+        if previous_question and conversation is not None:
+            pending_questions[conversation] = previous_question
         await message.answer(str(error))
         return
 

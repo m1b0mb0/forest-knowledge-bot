@@ -40,6 +40,7 @@ async def main() -> None:
     dispatcher.include_router(router)
 
     pending_questions: dict[tuple[int, int], str] = {}
+    logging.info("Groq model: %s", llm_settings.model)
     async with (
         AsyncGroq(
             api_key=llm_settings.api_key,
