@@ -60,7 +60,12 @@ async def my_documents_handler(message: Message, store: Store) -> None:
         name = " ".join(document.name.split())
         if len(name) > 500:
             name = name[:497] + "..."
-        line = f"\n{document.id} — {name}"
+        status = (
+            " (застаріла версія)"
+            if not document.active and document.superseded_by is not None
+            else ""
+        )
+        line = f"\n{document.id} — {name}{status}"
         if len((text + line).encode("utf-16-le")) // 2 > 4000:
             await message.answer(text)
             text = "Твої документи (продовження):\n"

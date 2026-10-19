@@ -5,6 +5,7 @@ import sqlite3
 import traceback
 from collections import deque
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,70 @@ def install_session(monkeypatch: pytest.MonkeyPatch, session: Session) -> None:
     monkeypatch.setattr(
         drive.aiohttp, "ClientSession", lambda **kwargs: session
     )
+
+
+@pytest.mark.parametrize("drive_updated", [False, True])
+def test_restart_keeps_superseded_drive_file_until_a_newer_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drive_updated: bool,
+) -> None:
+    name = "Членські внески рукавички Під кленом.txt"
+    first_text = "Дата: 2026-01-01\nВнесок — 3 каштани."
+    first_content = first_text.encode("utf-8")
+    first_file = document(
+        name=name, modifiedTime="2026-01-01T12:00:00Z",
+        size=str(len(first_content)),
+    )
+    store = Store(tmp_path)
+    store.initialize()
+    install_session(monkeypatch, Session(
+        Response({"mimeType": drive.FOLDER_MIME}),
+        Response({"files": [first_file]}), Response(first_content),
+    ))
+    asyncio.run(drive.import_archive(settings(tmp_path), store))
+    original_id = store.list_documents()[0].id
+    updated_text = "Дата: 2026-02-01\nВнесок — 5 каштанів."
+    telegram_id = store.add_telegram_document(
+        "10:20", name, updated_text.encode("utf-8"), updated_text,
+        101, "@test_author", datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+    assert not store.list_documents()[0].active
+    reopened = Store(tmp_path)
+    reopened.initialize()
+
+    if drive_updated:
+        latest = "Дата: 2026-03-01\nВнесок — 7 каштанів."
+        content = latest.encode("utf-8")
+        current_file = document(
+            name=name, modifiedTime="2026-03-01T12:00:00Z",
+            size=str(len(content)),
+        )
+        responses = [Response(content)]
+    else:
+        current_file = first_file
+        responses = []
+
+        def reject_parsing(content: bytes, filename: str) -> str:
+            pytest.fail("A cached superseded file must not be parsed again.")
+
+        monkeypatch.setattr(drive, "extract_document_text", reject_parsing)
+
+    session = Session(
+        Response({"mimeType": drive.FOLDER_MIME}),
+        Response({"files": [current_file]}), *responses,
+    )
+    install_session(monkeypatch, session)
+    assert asyncio.run(drive.import_archive(settings(tmp_path), reopened)) == 1
+
+    saved = {item.id: item for item in reopened.list_documents()}
+    assert saved[original_id].active is drive_updated
+    assert saved[telegram_id].active is not drive_updated
+    assert not session.responses
+    if drive_updated:
+        assert saved[original_id].text == latest
+        assert saved[telegram_id].superseded_by == original_id
+    else:
+        assert saved[original_id].superseded_by == telegram_id
+        assert len(session.requests) == 2
 
 
 def test_all_pages_are_imported_using_get_and_reimport_does_not_duplicate(

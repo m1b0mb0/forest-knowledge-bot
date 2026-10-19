@@ -8,8 +8,14 @@ import tempfile
 from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
+
+from bot.services.versions import (
+    AdviceVersion,
+    compare_versions,
+    extract_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +38,11 @@ class Document:
     owner_name: str | None = None
     uploaded_at: str | None = None
     deleted_at: str | None = None
+    advice_topic: str | None = None
+    advice_place: str | None = None
+    version_date: str | None = None
+    version_number: str | None = None
+    superseded_by: int | None = None
 
 
 class Store:
@@ -62,6 +73,11 @@ class Store:
                     owner_name TEXT,
                     uploaded_at TEXT,
                     deleted_at TEXT,
+                    advice_topic TEXT,
+                    advice_place TEXT,
+                    version_date TEXT,
+                    version_number TEXT,
+                    superseded_by INTEGER,
                     UNIQUE (source, source_id)
                 );
                 """
@@ -70,18 +86,30 @@ class Store:
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(documents)")
             }
+            backfill_versions = not {
+                "advice_topic", "advice_place", "version_date",
+                "version_number", "superseded_by",
+            }.issubset(columns)
             with connection:
+                connection.execute("BEGIN IMMEDIATE")
                 for name, column_type in (
                     ("owner_id", "INTEGER"),
                     ("owner_name", "TEXT"),
                     ("uploaded_at", "TEXT"),
                     ("deleted_at", "TEXT"),
+                    ("advice_topic", "TEXT"),
+                    ("advice_place", "TEXT"),
+                    ("version_date", "TEXT"),
+                    ("version_number", "TEXT"),
+                    ("superseded_by", "INTEGER"),
                 ):
                     if name not in columns:
                         connection.execute(
                             f"ALTER TABLE documents ADD COLUMN "
                             f"{name} {column_type}"
                         )
+                if backfill_versions:
+                    self._backfill_versions(connection)
 
     def upsert_drive_document(
         self,
@@ -104,6 +132,7 @@ class Store:
         now = datetime.now(timezone.utc).isoformat()
         created_file = False
         previous_path: Path | None = None
+        version = extract_version(name, text)
 
         with closing(self._connect()) as connection:
             try:
@@ -111,13 +140,30 @@ class Store:
                     connection.execute("BEGIN IMMEDIATE")
                     previous = connection.execute(
                         """
-                        SELECT relative_path FROM documents
+                        SELECT * FROM documents
                         WHERE source = 'drive' AND source_id = ?
                         """,
                         (source_id,),
                     ).fetchone()
                     if previous is not None:
                         previous_path = Path(previous["relative_path"])
+                        previous_version = self._version(previous)
+                        comparison = self._compare_incoming(
+                            version, modified_at, previous,
+                        )
+                        if comparison == -1:
+                            # Keep the newest known content and its clock.
+                            # A remote rollback must not erase that evidence.
+                            return int(previous["id"])
+                        reactivate = (
+                            not previous["active"]
+                            and previous["deleted_at"] is None
+                            and previous["superseded_by"] is not None
+                            and previous_version is not None
+                            and comparison == 1
+                        )
+                    else:
+                        reactivate = False
 
                     destination_exists = destination.exists()
                     if (
@@ -131,14 +177,20 @@ class Store:
                         """
                         INSERT INTO documents (
                             source, source_id, name, relative_path, text,
-                            modified_at, created_at, imported_at
-                        ) VALUES ('drive', ?, ?, ?, ?, ?, ?, ?)
+                            modified_at, created_at, imported_at,
+                            advice_topic, advice_place,
+                            version_date, version_number
+                        ) VALUES ('drive', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT (source, source_id) DO UPDATE SET
                             name = excluded.name,
                             relative_path = excluded.relative_path,
                             text = excluded.text,
                             modified_at = excluded.modified_at,
-                            imported_at = excluded.imported_at
+                            imported_at = excluded.imported_at,
+                            advice_topic = excluded.advice_topic,
+                            advice_place = excluded.advice_place,
+                            version_date = excluded.version_date,
+                            version_number = excluded.version_number
                         """,
                         (
                             source_id,
@@ -148,6 +200,7 @@ class Store:
                             modified_at,
                             now,
                             now,
+                            *self._version_values(version),
                         ),
                     )
                     row = connection.execute(
@@ -158,6 +211,10 @@ class Store:
                         (source_id,),
                     ).fetchone()
                     document_id = int(row["id"])
+                    self._supersede_versions(
+                        connection, version,
+                        reactivate_id=document_id if reactivate else None,
+                    )
             except Exception:
                 if created_file:
                     self._remove_file(destination)
@@ -193,6 +250,7 @@ class Store:
         destination = self.data_dir / relative_path
         now = datetime.now(timezone.utc).isoformat()
         created_file = False
+        version = extract_version(name, text)
 
         with closing(self._connect()) as connection:
             try:
@@ -221,8 +279,12 @@ class Store:
                         INSERT INTO documents (
                             source, source_id, name, relative_path, text,
                             created_at, imported_at,
-                            owner_id, owner_name, uploaded_at
-                        ) VALUES ('telegram', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            owner_id, owner_name, uploaded_at,
+                            advice_topic, advice_place,
+                            version_date, version_number
+                        ) VALUES (
+                            'telegram', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
                         """,
                         (
                             source_id,
@@ -234,9 +296,11 @@ class Store:
                             owner_id,
                             owner_name,
                             uploaded_time,
+                            *self._version_values(version),
                         ),
                     )
                     document_id = int(cursor.lastrowid)
+                    self._supersede_versions(connection, version)
             except Exception:
                 if created_file:
                     self._remove_file(destination)
@@ -328,6 +392,211 @@ class Store:
         self._remove_file(destination)
         return True
 
+    def _backfill_versions(self, connection: sqlite3.Connection) -> None:
+        """Infer profiles once when upgrading a pre-version database."""
+        versions: dict[tuple[str, str], AdviceVersion] = {}
+        for row in connection.execute("SELECT * FROM documents").fetchall():
+            version = extract_version(row["name"], row["text"])
+            connection.execute(
+                """
+                    UPDATE documents SET advice_topic = ?, advice_place = ?,
+                        version_date = ?, version_number = ? WHERE id = ?
+                """,
+                (*self._version_values(version), row["id"]),
+            )
+            if version is not None:
+                versions[(version.topic, version.place)] = version
+        for version in versions.values():
+            self._supersede_versions(connection, version)
+
+    @staticmethod
+    def _version_values(
+        version: AdviceVersion | None,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        if version is None:
+            return None, None, None, None
+        return (
+            version.topic,
+            version.place,
+            version.published_on.isoformat()
+            if version.published_on is not None else None,
+            ".".join(str(part) for part in version.number)
+            if version.number is not None else None,
+        )
+
+    @staticmethod
+    def _version(row: sqlite3.Row) -> AdviceVersion | None:
+        if row["advice_topic"] is None or row["advice_place"] is None:
+            return None
+        try:
+            return AdviceVersion(
+                topic=row["advice_topic"],
+                place=row["advice_place"],
+                published_on=(
+                    date.fromisoformat(row["version_date"])
+                    if row["version_date"] is not None else None
+                ),
+                number=(
+                    tuple(
+                        int(part) for part in row["version_number"].split(".")
+                    )
+                    if row["version_number"] is not None else None
+                ),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_timestamp(value: str | None) -> datetime | None:
+        try:
+            timestamp = datetime.fromisoformat(value) if value else None
+        except ValueError:
+            return None
+        if timestamp is None or timestamp.utcoffset() is None:
+            return None
+        return timestamp
+
+    @classmethod
+    def _timestamp(cls, row: sqlite3.Row) -> datetime | None:
+        value = (
+            row["uploaded_at"]
+            if row["source"] == "telegram" else row["modified_at"]
+        )
+        return cls._parse_timestamp(value) or cls._parse_timestamp(
+            row["created_at"]
+        )
+
+    @classmethod
+    def _compare_incoming(
+        cls,
+        incoming: AdviceVersion | None,
+        modified_at: str | None,
+        previous: sqlite3.Row,
+    ) -> int | None:
+        """Protect a Drive source's newest known content from regressions."""
+        previous_version = cls._version(previous)
+        timestamp = cls._parse_timestamp(modified_at) or cls._parse_timestamp(
+            previous["created_at"]
+        )
+        previous_timestamp = cls._timestamp(previous)
+        if (
+            incoming is None
+            or previous_version is None
+            or (incoming.topic, incoming.place)
+            != (previous_version.topic, previous_version.place)
+            or timestamp is None
+            or previous_timestamp is None
+        ):
+            return None
+        return compare_versions(
+            incoming, timestamp, previous_version, previous_timestamp,
+        )
+
+    @classmethod
+    def _supersede_versions(
+        cls,
+        connection: sqlite3.Connection,
+        version: AdviceVersion | None,
+        *,
+        reactivate_id: int | None = None,
+    ) -> None:
+        """Hide proven older advice while preserving deletion and ambiguity."""
+        if version is None:
+            return
+        rows = connection.execute(
+            """
+                SELECT * FROM documents
+                WHERE advice_topic = ? AND advice_place = ? ORDER BY id
+            """,
+            (version.topic, version.place),
+        ).fetchall()
+        newer: dict[int, set[int]] = {row["id"]: set() for row in rows}
+        groups = {identifier: identifier for identifier in newer}
+
+        def group(identifier: int) -> int:
+            while identifier != groups[identifier]:
+                groups[identifier] = groups[groups[identifier]]
+                identifier = groups[identifier]
+            return identifier
+
+        for position, left in enumerate(rows):
+            left_version = cls._version(left)
+            left_timestamp = cls._timestamp(left)
+            if left_version is None or left_timestamp is None:
+                continue
+            for right in rows[position + 1:]:
+                right_version = cls._version(right)
+                right_timestamp = cls._timestamp(right)
+                if right_version is None or right_timestamp is None:
+                    continue
+                comparison = compare_versions(
+                    left_version, left_timestamp,
+                    right_version, right_timestamp,
+                )
+                if comparison == -1:
+                    newer[left["id"]].add(right["id"])
+                elif comparison == 1:
+                    newer[right["id"]].add(left["id"])
+                elif comparison == 0:
+                    groups[group(left["id"])] = group(right["id"])
+
+        grouped_newer: dict[int, set[int]] = {
+            group(identifier): set() for identifier in newer
+        }
+        for identifier, replacements in newer.items():
+            grouped_newer[group(identifier)].update(
+                group(replacement) for replacement in replacements
+            )
+        if cls._has_version_cycle(grouped_newer):
+            # Mixed explicit metadata and clocks can contradict each other.
+            # Equal versions share a node, so a strict path between them is
+            # also a contradiction. Preserve the current availability.
+            return
+        for row in rows:
+            identifier = row["id"]
+            if newer[identifier]:
+                # Any proven newer source explains this decision; choosing a
+                # pointer does not choose between incomparable active sources.
+                replacement = min(newer[identifier])
+                connection.execute(
+                    "UPDATE documents SET active = 0, superseded_by = ? "
+                    "WHERE id = ?",
+                    (replacement, identifier),
+                )
+            elif (
+                identifier == reactivate_id
+                and row["deleted_at"] is None
+                and row["superseded_by"] in newer
+                and all(
+                    identifier in newer[other["id"]]
+                    for other in rows if other["id"] != identifier
+                )
+            ):
+                connection.execute(
+                    "UPDATE documents SET active = 1, superseded_by = NULL "
+                    "WHERE id = ?",
+                    (identifier,),
+                )
+
+    @staticmethod
+    def _has_version_cycle(newer: dict[int, set[int]]) -> bool:
+        visited: set[int] = set()
+        visiting: set[int] = set()
+
+        def visit(identifier: int) -> bool:
+            if identifier in visiting:
+                return True
+            if identifier in visited:
+                return False
+            visiting.add(identifier)
+            if any(visit(other) for other in newer[identifier]):
+                return True
+            visiting.remove(identifier)
+            visited.add(identifier)
+            return False
+
+        return any(visit(identifier) for identifier in newer)
+
     @staticmethod
     def _document(row: sqlite3.Row) -> Document:
         return Document(
@@ -345,6 +614,11 @@ class Store:
             owner_name=row["owner_name"],
             uploaded_at=row["uploaded_at"],
             deleted_at=row["deleted_at"],
+            advice_topic=row["advice_topic"],
+            advice_place=row["advice_place"],
+            version_date=row["version_date"],
+            version_number=row["version_number"],
+            superseded_by=row["superseded_by"],
         )
 
     def _connect(self) -> sqlite3.Connection:

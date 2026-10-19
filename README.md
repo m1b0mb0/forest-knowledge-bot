@@ -55,6 +55,14 @@ Keep secrets in the local `.env`, which is excluded from Git and the Docker imag
 - Use `/my_documents` to list your uploads and `/delete <id>` to delete one.
   Only the sender can delete their Telegram files; deleted content is excluded
   from answers. Google Drive documents cannot be deleted through the bot.
+- Versioning assumes one complete advice for one place per file. It matches
+  the same topic and place from a filename such as
+  `Членські внески рукавички Під дубом.txt`, or `Тема:` and `Місце:` headers.
+  Put optional `Версія: 2` and `Дата: 2026-10-19` headers in the first 20 lines.
+  Numeric versions are compared when both are present; otherwise the explicit
+  date or upload/Drive modification time applies. Topic synonyms are not merged.
+  Uncertain matches remain available. Superseded files are excluded from answers
+  and marked in `/my_documents`; deleting a newer file does not restore them.
 - PyMuPDF extracts PDF text and uses Ukrainian and English OCR data for pages
   without embedded text. OCR accuracy depends on scan quality; images on pages
   that also contain embedded text are not recognized.

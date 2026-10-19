@@ -3,6 +3,7 @@
 import asyncio
 import re
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -86,6 +87,25 @@ def test_empty_list_has_a_friendly_response() -> None:
     assert answers(incoming)[0].strip()
     assert "[]" not in answers(incoming)[0]
     store.delete_telegram_document.assert_not_called()
+
+
+def test_superseded_document_remains_listed_with_its_status() -> None:
+    incoming = message()
+    store = Mock(spec=Store)
+    store.list_telegram_documents.return_value = [
+        replace(
+            document(71, "Попередня порада.txt"),
+            active=False, superseded_by=82,
+        ),
+        document(82, "Чинна порада.txt"),
+    ]
+
+    asyncio.run(my_documents_handler(incoming, store))
+
+    text = "\n".join(answers(incoming))
+    assert "71 — Попередня порада.txt (застаріла версія)" in text
+    assert "82 — Чинна порада.txt" in text
+    assert text.count("застаріла версія") == 1
 
 
 def test_large_unicode_list_preserves_ids_within_telegram_length() -> None:
